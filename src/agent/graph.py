@@ -41,7 +41,7 @@ def coerce_user_request(state: dict) -> str:
 
 
 def parse_intent(state: TourismState) -> dict:
-    """Live OpenAI path: do not pre-parse place/dates. Offline tests still use keyword intent."""
+    """Prepare empty research buckets; the live brain interprets the trip."""
     request = coerce_user_request(state)
     buckets = {
         "tool_trace": ["parse_intent"],
@@ -107,20 +107,28 @@ def brain_intent_node(state: TourismState) -> dict:
 
 
 def execute_plan_node(state: TourismState) -> dict:
-    if _llm_enabled() or state.get("brain_ran_tools"):
+    if (state.get("brain_source") != "fallback" and _llm_enabled()) or state.get("brain_ran_tools"):
         return {}
     return execute_plan(state)
 
 
 def route_after_brain(state: TourismState) -> str:
+    if state.get("awaiting_user"):
+        return "compose_response"
+    if state.get("brain_source") == "fallback":
+        return "execute_plan"
     if _llm_enabled() or state.get("brain_ran_tools"):
         return "compose_response"
     return "execute_plan"
 
 
 def compose_node(state: TourismState) -> dict:
+    from src.agent.compose import compose_answer_with_source
+
+    response, source = compose_answer_with_source(state)
     return {
-        "final_response": compose_answer(state),
+        "final_response": response,
+        "answer_source": source,
         "tool_trace": list(state.get("tool_trace") or []) + ["compose_response"],
     }
 

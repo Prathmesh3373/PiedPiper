@@ -12,3 +12,4 @@ kaggle.json
 !models/.gitkeep
 .cursor/
 agent-transcripts/
+*.log

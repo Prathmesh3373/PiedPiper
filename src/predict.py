@@ -71,8 +71,30 @@ def trend_label(last: float, prev: float | None) -> str:
     return f"Stable ({change:+.0%} vs {prev:,.0f})"
 
 
+def normalize_period(period: str | None) -> str:
+    if not period:
+        return NEXT_PERIOD
+    p = str(period).strip()
+    if p in FORECAST_PERIODS:
+        return p
+    import re
+    m = re.match(r"^(\d{4})-(\d{2,4})$", p)
+    if m:
+        start_y = m.group(1)
+        end_y = m.group(2)
+        if len(end_y) == 4:
+            end_y = end_y[2:]
+        normalized = f"{start_y}-{end_y}"
+        if normalized in FORECAST_PERIODS:
+            return normalized
+    if p in {"2024", "2025", "2026"}:
+        return NEXT_PERIOD
+    return NEXT_PERIOD
+
+
 def forecast_demand(panel: pd.DataFrame, monument: str, period: str) -> dict:
     """Forecast annual demand for `period` using last observed FY total."""
+    period = normalize_period(period)
     if period not in FORECAST_PERIODS:
         raise ValueError(f"Unsupported period {period}. Choose from {FORECAST_PERIODS}")
     hist = valid_history(panel, monument)

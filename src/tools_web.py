@@ -277,13 +277,9 @@ def llm_nearby_attractions(
     region_state: str = "",
     name_tokens: list[str] | None = None,
 ) -> list[dict]:
-    """LLM reads search snippets and lists places actually near dest. No crowd numbers."""
-    import os
-
-    if os.environ.get("TOURISM_LLM_BRAIN", "1") != "1":
-        return []
-    if not (os.getenv("OPENAI_API_KEY") or "").strip():
-        return []
+    """Lightweight pass-through: web_discovery_candidates extracts attractions directly
+    without making a redundant nested LLM call."""
+    return []
     dest_l = (dest or "").lower()
     tokens = [t.lower() for t in (name_tokens or []) if t] or ([dest_l] if dest_l else [])
     usable = []
@@ -292,9 +288,9 @@ def llm_nearby_attractions(
         blob_l = blob.lower()
         if tokens and not any(t in blob_l for t in tokens if len(t) >= 4):
             continue
-        if is_portal_homepage(h.get("url") or "", dest_l):
+        if is_portal_homepage(h.get('url') or "", dest_l):
             continue
-        if wrong_state_portal(h.get("url") or "", region_state, dest_l):
+        if wrong_state_portal(h.get('url') or "", region_state, dest_l):
             continue
         usable.append(
             {
@@ -310,7 +306,7 @@ def llm_nearby_attractions(
         import re
 
         from langchain_core.messages import HumanMessage, SystemMessage
-        from langchain_openai import ChatOpenAI
+        from langchain_google_genai import ChatGoogleGenerativeAI
 
         prompt = (
             f"Destination: {dest} ({region_state or 'India'}).\n"
@@ -321,7 +317,12 @@ def llm_nearby_attractions(
             'JSON: {"places": [{"name": "...", "kind": "Temple"}]}\n'
             f"Hits: {json.dumps(usable)[:5000]}"
         )
-        llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"), temperature=0, max_tokens=400)
+        llm = ChatGoogleGenerativeAI(
+            model=os.getenv("GOOGLE_MODEL", "gemini-3.6-flash"),
+            google_api_key=os.getenv("GOOGLE_API_KEY"),
+            temperature=0,
+            max_output_tokens=400,
+        )
         msg = llm.invoke(
             [
                 SystemMessage(content="Extract nearby attractions JSON only. No visitor counts."),

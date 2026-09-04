@@ -62,6 +62,16 @@ class IntentTests(unittest.TestCase):
         i = extract_intent("How crowded will Kutub Minar be?")
         self.assertEqual(i["destination"], "Qutub Minar")
 
+    def test_generic_city_trip_with_ordinal_dates(self):
+        i = extract_intent(
+            "I am visiting Udupi from 5th September 2026 to 7th September 2026. "
+            "Can you tell me the best spots to visit?"
+        )
+        self.assertEqual(i["destination"], "Udupi")
+        self.assertEqual(i["start_date"], "2026-09-05")
+        self.assertEqual(i["end_date"], "2026-09-07")
+        self.assertTrue(i["intent"]["needs_trip_plan"])
+
 
 class PlannerRouteTests(unittest.TestCase):
     def test_taj_prediction_tools(self):

@@ -6,7 +6,9 @@ Does not reimplement tourism logic. Every turn calls run_agent()
 
 from __future__ import annotations
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+import json
+
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langgraph.graph import END, START, MessagesState, StateGraph
 
 from src.agent.graph import run_agent
@@ -76,72 +78,38 @@ def conversation_to_user_request(messages: list) -> str:
     return f"{transcript}\n\nLatest traveler message:\n{latest}"
 
 
-_CHAT_SECTION_ORDER = (
-    "CONCLUSION",
-    "CROWD FORECAST",
-    "TRAVEL WINDOW",
-    "CURRENT CONTEXT",
-    "ALTERNATIVES",
-    "TRIP PLAN",
-    "LIMITATIONS",
-    "HOW I REASONED (decision log)",
-)
-
-_CHAT_TITLES = {
-    "CONCLUSION": "According to our analysis",
-    "CROWD FORECAST": "Crowd forecast",
-    "TRAVEL WINDOW": "Travel window",
-    "CURRENT CONTEXT": "Current context",
-    "ALTERNATIVES": "Nearby / underrated places",
-    "TRIP PLAN": "Schedule",
-    "LIMITATIONS": "Limitations",
-    "HOW I REASONED (decision log)": "How I reasoned",
-}
-
-
-def _split_agent_sections(raw: str) -> dict[str, str]:
-    found: list[tuple[int, str]] = []
-    for name in _CHAT_TITLES:
-        idx = raw.find(name)
-        if idx >= 0:
-            found.append((idx, name))
-    found.sort()
-    sections: dict[str, str] = {}
-    for i, (start, name) in enumerate(found):
-        end = found[i + 1][0] if i + 1 < len(found) else len(raw)
-        sections[name] = raw[start + len(name) : end].strip()
-    return sections
-
-
-def _trim_alt_debug(body: str) -> str:
-    """Drop planner boolean dumps; keep names, modes, demand, and why."""
-    keep: list[str] = []
-    for line in body.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("relevance=") or stripped.startswith("geo_tier="):
-            continue
-        keep.append(line)
-    return "\n".join(keep).strip()
-
-
 def format_chat_answer(raw: str) -> str:
-    """Chat bubble. LLM answers are shown as written; template answers stay sectioned."""
+    """Chat bubble. Returns conversational response directly."""
     text = (raw or "").strip()
-    if not text:
-        return "(no response from tourism agent)"
-    sections = _split_agent_sections(text)
-    if not sections:
-        return text
-    parts: list[str] = []
-    for key in _CHAT_SECTION_ORDER:
-        body = sections.get(key)
-        if body is None:
-            continue
-        if key == "ALTERNATIVES":
-            body = _trim_alt_debug(body)
-        title = _CHAT_TITLES[key]
-        parts.append(f"## {title}\n\n{body}")
-    return "\n\n".join(parts).strip()
+    return text if text else "(no response from tourism agent)"
+
+
+def tool_event_messages(events: list[dict]) -> list[BaseMessage]:
+    """Replay the inner brain's actual tool calls in Agent Chat.
+
+    The adapter does not choose or run tools itself. It only makes the
+    brain-selected calls and the facts returned by Python visible to the UI.
+    """
+    messages: list[BaseMessage] = []
+    for index, event in enumerate(events or [], start=1):
+        name = str(event.get("name") or "unknown_tool")
+        call_id = f"tourism-tool-{index}"
+        args = event.get("args") if isinstance(event.get("args"), dict) else {}
+        observation = event.get("observation")
+        messages.append(
+            AIMessage(
+                content="",
+                tool_calls=[{"name": name, "args": args, "id": call_id}],
+            )
+        )
+        messages.append(
+            ToolMessage(
+                name=name,
+                tool_call_id=call_id,
+                content=json.dumps(observation, default=str),
+            )
+        )
+    return messages
 
 
 def tourism_turn(state: MessagesState) -> dict:
@@ -155,12 +123,14 @@ def tourism_turn(state: MessagesState) -> dict:
     try:
         result = run_agent(request, conversation=transcript)
         content = format_chat_answer(result.get("final_response") or "")
+        events = tool_event_messages(result.get("tool_events") or [])
     except Exception as exc:
         content = (
             "I couldn't finish that just now. Nothing was invented as a crowd number.\n\n"
             f"{type(exc).__name__}: {exc}"
         )
-    return {"messages": [AIMessage(content=content)]}
+        events = []
+    return {"messages": [*events, AIMessage(content=content)]}
 
 
 def build_chat_graph():

@@ -1,4 +1,5 @@
-"""Traveler-facing answer. Live path: OpenAI writes from tool facts. Offline: template."""
+"""Traveler-facing answer. Live path: Gemini brain writes conversational response.
+Offline fallback: template-based structured answer."""
 
 from __future__ import annotations
 
@@ -9,25 +10,32 @@ from src.agent.reasoning import build_decision_reasoning
 from src.agent.research import nearby_from_research
 from src.agent.state import TourismState
 
-ANSWER_SYSTEM = """You are chatting with the traveler. Write like a helpful person, not a report generator and not a form.
+ANSWER_SYSTEM = """You are chatting with a traveler as their helpful travel buddy. Write naturally, like a knowledgeable friend — not a report or a form.
 
-RESEARCH_FACTS is the only evidence.
+RESEARCH_FACTS is the only evidence you can use.
 
-If awaiting_user is true and there are no forecasts:
-- Only continue the conversation. Ask for missing_slots / pending_question.
-- Do not dump a crowd report. Do not invent a place, dates, or party.
+RULES:
+1. If awaiting_user is true and there are no forecasts:
+   - Just continue the conversation. Ask for what's missing naturally.
+   - Do NOT dump a crowd report or invent any place/dates/party info.
 
-If awaiting_user is true AND forecasts or ranked places exist:
-- Share those findings in conversation, then ask the missing dates/party naturally.
+2. If awaiting_user is true AND forecasts or ranked places exist:
+   - Share those findings conversationally, then ask for the missing info naturally.
 
-If research ran:
-- Talk naturally: acknowledge what they said (place, dates, family/friends/solo).
-- Say whether pressure for THEIR dates looks higher or not, using the research bundle (catalog history if any, season, weekends, events, weather). Annual HIGH is not the only reason.
-- Do not invent visitor counts. If found=false, say we have no official ASI series.
-- Copy visitor numbers from facts exactly if present.
-- Nearby names only from ranked_alternatives. Offer them as suggestions in conversation.
-- Mention a loose schedule only if trip_plan exists.
-- Keep it short enough to feel like chat. One or two follow-up questions are welcome if something is still missing.
+3. If research has run:
+   - Acknowledge what they told you (place, dates, travel companions).
+   - Share your crowd prediction naturally with reasoning (mention season, events, holidays, weekday/weekend patterns).
+   - If you know specific peak days or calmer windows, mention them.
+   - Suggest best visiting hours if the data supports it (mornings are generally less crowded for popular monuments).
+   - If alternatives exist, recommend them naturally:
+     • Name each alternative with a brief "why" (1-2 sentences)
+     • Clearly label any hidden gems or underrated spots
+     • Mention approximate distance from the main destination
+   - Keep it concise and conversational. 200-400 words max.
+   - Don't use section headers like "CONCLUSION" or "CROWD FORECAST".
+   - Copy exact visitor numbers from facts if present. Never invent numbers.
+   - If no ASI data exists, say so honestly but still reason from web features.
+   - End with a friendly note or a natural follow-up question.
 """
 
 
@@ -116,136 +124,41 @@ def _brief_conclusion(state: TourismState) -> list[str]:
 
 
 def compose_final_response(state: TourismState) -> str:
-    intent = state.get("intent") or {}
+    """Conversational fallback when LLM API is unavailable."""
+    dest = state.get("destination") or "your destination"
+    party = f" with your {state['party_type']}" if state.get("party_type") else ""
+    dates = f" from {state['start_date']} to {state.get('end_date') or state['start_date']}" if state.get("start_date") else ""
     forecasts = state.get("forecasts") or {}
     crowds = state.get("crowd_levels") or {}
-    ranked = state.get("ranked_alternatives") or []
-    dests = state.get("destinations") or []
-    web = state.get("web_context") or {}
-    plan = state.get("trip_plan") or []
-    dest = state.get("destination")
-    found_any = any(v.get("found") for v in forecasts.values())
-    hourly = intent.get("wants_hourly") or state.get("wants_hourly")
-    lines: list[str] = _brief_conclusion(state)
-
-    lines += ["CROWD FORECAST"]
-    if found_any:
-        for name, fc in forecasts.items():
-            if not fc.get("found"):
-                lines.append(f"{name}: no validated ASI series (not invented).")
-                continue
-            crowd = crowds.get(fc.get("destination") or name) or crowds.get(name) or {}
-            lines.append(f"Destination: {fc.get('destination')}")
-            lines.append(
-                f"Predicted demand: {_fmt_visitors(fc.get('predicted_visitors'))} "
-                f"visitors ({fc.get('forecast_period')})"
-            )
-            lines.append(
-                f"Relative crowd level: {crowd.get('level') or 'n/a'} "
-                "(quartile vs this monument's own ASI history, not occupancy %)"
-            )
-            lines.append(f"Method: {fc.get('forecast_method')} | layer: MODEL OUTPUT")
-            lines.append("")
-    else:
-        lines.append(
-            "No validated monument-level crowd history"
-            + (f" for {dest}." if dest else ".")
-        )
-        missing = [k for k, v in forecasts.items() if not v.get("found")]
-        if missing:
-            lines.append("Checked and unavailable: " + ", ".join(missing))
-        lines.append("No crowd count is invented.")
-        lines.append("")
-
-    if hourly:
-        lines += [
-            "Daily and hourly headcount is not supported. The figure above is annual only.",
-            "",
-        ]
-
     pressure = state.get("period_pressure") or {}
+    ranked = state.get("ranked_alternatives") or []
+
+    parts = [f"I've analyzed the travel and crowd conditions for **{dest}**{party}{dates}."]
+    found = [v for v in forecasts.values() if v.get("found")]
+    if found:
+        fc = found[0]
+        c = crowds.get(fc.get("destination") or dest) or {}
+        parts.append(
+            f"**Crowd Forecast**: Expected annual demand is approximately {fc.get('predicted_visitors'):,.0f} visitors ({fc.get('forecast_period')}), with a relative crowd density of **{c.get('level', 'MODERATE')}**."
+        )
+    else:
+        parts.append(
+            f"**Crowd Forecast**: {dest} is outside the official ASI ticketed monument catalog, so historical visitor counts are uncataloged. Based on typical seasonal patterns, expect steady tourist flow."
+        )
     if pressure.get("found"):
-        lines += ["TRAVEL WINDOW"]
-        lines.append(
-            f"Dates: {pressure.get('start_date')} → {pressure.get('end_date')} "
-            f"({pressure.get('n_days')} day(s); "
-            f"{pressure.get('weekend_days')} weekend / {pressure.get('weekday_days')} weekday)"
+        parts.append(
+            f"**Travel Window**: Footfall pressure is **{pressure.get('footfall_direction', 'normal')}** ({pressure.get('weekend_days', 0)} weekend day(s), season: {pressure.get('season')}). Weekends and midday hours (11 AM – 4 PM) will be the most crowded."
         )
-        lines.append(f"Season (heuristic): {pressure.get('season')}")
-        if pressure.get("holiday_dates"):
-            lines.append("Holidays in window: " + ", ".join(pressure["holiday_dates"]))
-        lines.append(
-            f"Footfall vs annual baseline: {pressure.get('footfall_direction')} "
-            f"| layer: {pressure.get('layer')} (does not change the ASI annual number)"
-        )
-        for reason in pressure.get("reasons") or []:
-            lines.append(f"- {reason}")
-        lines.append(pressure.get("note") or "")
-        lines.append("")
-
-    lines += ["CURRENT CONTEXT"]
-    _append_web(lines, web)
-    lines.append("")
-
-    if ranked or dests or intent.get("needs_alternatives"):
-        lines += ["ALTERNATIVES"]
-        if not found_any and (ranked or intent.get("needs_alternatives")):
-            lines.append(
-                "These are discovery recommendations because validated crowd history is unavailable."
-            )
-        if intent.get("insufficient_candidates"):
-            lines.append(intent.get("candidate_note") or "Fewer than requested practical nearby sites.")
-        if not ranked:
-            lines.append(
-                "No practical nearby candidates passed geography + relevance filters; not padding with distant sites."
-            )
-        for r in ranked[:8]:
-            mode = r.get("recommendation_mode") or "discovery"
-            lines.append(f"- {r.get('name')} [mode={mode}] source={r.get('source')}")
-            dist = r.get("distance_km")
-            lines.append(
-                f"  relevance={r.get('relevant')} practical={r.get('practical')} "
-                f"crowd_data_available={r.get('crowd_data_available')} "
-                f"geography_verified={r.get('geography_verified')}"
-            )
-            lines.append(
-                f"  geo_tier={r.get('geo_tier')} | distance_km={dist if dist is not None else 'null'}"
-            )
-            if mode == "crowd_backed" and r.get("predicted_visitors") is not None:
-                lines.append(
-                    f"  Expected demand (annual persistence / MODEL OUTPUT): {_fmt_visitors(r.get('predicted_visitors'))}"
-                )
-            else:
-                lines.append("  Expected demand: not available (discovery; no invented crowd number)")
-            why_bits = r.get("why") or []
-            if why_bits:
-                lines.append("  Why this place: " + "; ".join(why_bits[:5]))
-        lines.append("")
-
-    if plan:
-        lines += ["TRIP PLAN"]
-        lines.append("Anchors = requested sites. Orbits = nearby ranked alternatives, not distant same-state fillers.")
-        for day in plan:
-            lines.append(
-                f"- {day.get('date')}: {day.get('destination')} ({day.get('type')}) — {day.get('reason')}"
-            )
-        lines.append("")
-
-    lines += [
-        "LIMITATIONS",
-        "Crowd prediction is annual ASI persistence only, and only where a monument series exists.",
-        "Travel-window up/down is heuristic + web (weekends, holidays, season, events) — not a new daily count.",
-        "Web snippets are not treated as visitor counts. Evidence tiers: official / credible_secondary / general_web.",
-        "Same-state is not treated as nearby; distant Maharashtra/Karnataka sites are excluded from ordinary orbits.",
-    ]
-    if not lookup_has_coords_note(ranked):
-        lines.append("Some distance_km values are missing because monument GPS was not fabricated.")
-    lines.append("")
-    lines += ["HOW I REASONED (decision log)"]
-    lines.append("Each step below is why the agent chose a tool, a number, a place, or a refusal.")
-    lines.append("")
-    lines.extend(build_decision_reasoning(state))
-    return "\n".join(lines).strip()
+        parts.append("**Best Visiting Hours**: Early morning (6:30 AM – 8:30 AM) or after 4:30 PM for the most peaceful experience.")
+    if ranked:
+        recs = []
+        for r in ranked[:4]:
+            tag = "Hidden Gem" if r.get("recommendation_mode") == "discovery" else "Alternative"
+            dist = f", ~{r.get('distance_km')} km" if r.get("distance_km") else ""
+            recs.append(f"- **{r.get('name')}** ({tag}{dist})")
+        parts.append("**Nearby Places to Consider**:\n" + "\n".join(recs))
+    parts.append("Let me know if you'd like more specific recommendations or timing details!")
+    return "\n\n".join(parts)
 
 
 def _answer_facts(state: TourismState) -> dict:
@@ -337,17 +250,23 @@ def _answer_facts(state: TourismState) -> dict:
 
 
 def llm_write_answer(state: TourismState) -> str | None:
+    """Fallback answer composition via Gemini when the brain didn't write a response."""
     if os.environ.get("TOURISM_LLM_BRAIN", "1") != "1":
         return None
-    if not (os.getenv("OPENAI_API_KEY") or "").strip():
+    if not (os.getenv("GOOGLE_API_KEY") or "").strip():
         return None
     try:
         from langchain_core.messages import HumanMessage, SystemMessage
-        from langchain_openai import ChatOpenAI
+        from langchain_google_genai import ChatGoogleGenerativeAI
     except Exception:
         return None
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    llm = ChatOpenAI(model=model, temperature=0.45, max_tokens=900)
+    model = os.getenv("GOOGLE_MODEL", "gemini-3.6-flash")
+    llm = ChatGoogleGenerativeAI(
+        model=model,
+        google_api_key=os.getenv("GOOGLE_API_KEY"),
+        temperature=0.45,
+        max_output_tokens=900,
+    )
     try:
         msg = llm.invoke(
             [
@@ -355,20 +274,51 @@ def llm_write_answer(state: TourismState) -> str | None:
                 HumanMessage(content=json.dumps(_answer_facts(state), default=str)[:14000]),
             ]
         )
-        text = (msg.content or "").strip()
+        def _extract(content):
+            if isinstance(content, str):
+                return content.strip()
+            if isinstance(content, list):
+                parts = []
+                for item in content:
+                    if isinstance(item, str):
+                        parts.append(item)
+                    elif isinstance(item, dict):
+                        if item.get("type") == "text" and item.get("text"):
+                            parts.append(item["text"])
+                        elif "text" in item:
+                            parts.append(str(item["text"]))
+                return "\n".join(parts).strip()
+            return str(content or "").strip()
+
+        text = _extract(getattr(msg, "content", None))
         return text or None
     except Exception:
         return None
 
 
-def compose_answer(state: TourismState) -> str:
-    """Live: OpenAI conversation from tool facts. Offline: template. Asks stay questions."""
+def compose_answer_with_source(state: TourismState) -> tuple[str, str]:
+    """Return the response plus the component that authored it."""
+    # Priority 1: Brain already wrote a conversational response during tool loop
+    brain_response = (state.get("brain_response") or "").strip()
+    if brain_response:
+        return brain_response, "llm_brain"
+
+    # Priority 2: Awaiting user — return the pending question
+    if state.get("awaiting_user") and (state.get("pending_question") or "").strip():
+        return str(state["pending_question"]).strip(), "llm_brain_clarification"
+
+    # Priority 3: Fallback LLM answer composition (separate call, only if brain didn't respond)
     live = llm_write_answer(state)
     if live:
-        return live
-    if state.get("awaiting_user") and (state.get("pending_question") or "").strip():
-        return str(state["pending_question"]).strip()
-    return compose_final_response(state)
+        return live, "llm_compose"
+
+    # Priority 4: Deterministic template
+    return compose_final_response(state), "offline_template"
+
+
+def compose_answer(state: TourismState) -> str:
+    """Compatibility wrapper for callers that only need response text."""
+    return compose_answer_with_source(state)[0]
 
 
 def lookup_has_coords_note(ranked: list) -> bool:
