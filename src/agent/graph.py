@@ -120,8 +120,12 @@ def route_after_brain(state: TourismState) -> str:
 
 
 def compose_node(state: TourismState) -> dict:
+    from src.agent.compose import compose_answer_with_source
+
+    response, source = compose_answer_with_source(state)
     return {
-        "final_response": compose_answer(state),
+        "final_response": response,
+        "answer_source": source,
         "tool_trace": list(state.get("tool_trace") or []) + ["compose_response"],
     }
 

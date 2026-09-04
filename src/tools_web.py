@@ -307,9 +307,9 @@ def llm_nearby_attractions(
         blob_l = blob.lower()
         if tokens and not any(t in blob_l for t in tokens if len(t) >= 4):
             continue
-        if is_portal_homepage(h.get("url") or "", dest_l):
+        if is_portal_homepage(h.get('url') or "", dest_l):
             continue
-        if wrong_state_portal(h.get("url") or "", region_state, dest_l):
+        if wrong_state_portal(h.get('url') or "", region_state, dest_l):
             continue
         usable.append(
             {

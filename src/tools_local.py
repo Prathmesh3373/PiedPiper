@@ -12,6 +12,7 @@ from src.predict import (
     NEXT_PERIOD,
     forecast_demand,
     load_panel,
+    normalize_period,
     resolve_monument,
     valid_history,
 )
@@ -255,7 +256,7 @@ def get_historical_footfall(destination: str) -> dict:
 
 def forecast_crowd(destination: str, forecast_period: str | None = None) -> dict:
     """Deterministic persistence forecast. LLM must not compute this."""
-    period = forecast_period or NEXT_PERIOD
+    period = normalize_period(forecast_period)
     panel = load_panel()
     try:
         name = resolve_monument(panel, destination)

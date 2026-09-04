@@ -102,6 +102,10 @@ REGION_PLACES = [
     ("bangalore", "Bengaluru"),
     ("hampi", "Hampi"),
     ("sanchi", "Sanchi"),
+    ("udupi", "Udupi"),
+    ("goa", "Goa"),
+    ("jaipur", "Jaipur"),
+    ("varanasi", "Varanasi"),
 ]
 
 
@@ -167,7 +171,7 @@ def _dates(text: str) -> tuple[str | None, str | None]:
             pass
 
     range_dmy = re.search(
-        r"(?<!\d)(\d{1,2})\s*(?:-|to)\s*(\d{1,2})\s+"
+        r"(?<!\d)(\d{1,2})(?:st|nd|rd|th)?\s*(?:-|to)\s*(\d{1,2})(?:st|nd|rd|th)?\s+"
         r"(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?"
         r"(?:\s+((?:20)?\d{2}))?",
         text,
@@ -186,9 +190,9 @@ def _dates(text: str) -> tuple[str | None, str | None]:
             pass
 
     range2 = re.search(
-        r"(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?"
+        r"(\d{1,2})(?:st|nd|rd|th)?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?"
         r"(?:\s+((?:20)?\d{2}))?\s*(?:-|to|–)\s*"
-        r"(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?"
+        r"(\d{1,2})(?:st|nd|rd|th)?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?"
         r"(?:\s+((?:20)?\d{2}))?",
         text,
         re.I,
@@ -213,14 +217,13 @@ def _dates(text: str) -> tuple[str | None, str | None]:
         y = _year(single.group(4))
         mon = _mon(single.group(2))
         day = int(single.group(3) if single.group(1) is None else single.group(3))
-        # "September 4" -> group2 month, group3 day
         try:
             return datetime(y, mon, day).date().isoformat(), None
         except ValueError:
             pass
 
     dmy = re.search(
-        r"(?:on\s+)?(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?"
+        r"(?:on\s+)?(\d{1,2})(?:st|nd|rd|th)?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?"
         r"(?:\s+((?:20)?\d{2}))?",
         text,
         re.I,
@@ -316,6 +319,16 @@ def extract_intent(text: str) -> dict:
     elif re.search(r"\b(with (my )?friends|friends trip|with friends)\b", lower):
         party_type = "friends"
 
+    party = None
+    if any(w in lower for w in ("family", "parents", "kids", "children")):
+        party = "family"
+    elif any(w in lower for w in ("friends", "buddies", "group")):
+        party = "friends"
+    elif any(w in lower for w in ("solo", "alone", "myself")):
+        party = "solo"
+    elif any(w in lower for w in ("couple", "partner", "wife", "husband")):
+        party = "couple"
+
     if needs_trip_plan:
         needs_alternatives = True
         needs_current_context = True
@@ -337,6 +350,7 @@ def extract_intent(text: str) -> dict:
     }
     return {
         "destination": dest,
+        "party_type": party,
         "start_date": start,
         "end_date": end,
         "interests": interests,

@@ -30,7 +30,9 @@ class TourismState(TypedDict, total=False):
     climate_zone: str | None
     web_queries: list[str]
     web_raw_hits: list[dict]
+    brain_source: str
     brain_ran_tools: bool
+    tool_events: list[dict]
     decisions: list[str]
     start_date: str | None
     end_date: str | None
@@ -63,4 +65,5 @@ class TourismState(TypedDict, total=False):
     brain_source: str | None
     brain_ran_tools: bool
     final_response: str
+    answer_source: str
     messages: Annotated[list[Any], add_messages]

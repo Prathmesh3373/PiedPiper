@@ -6,7 +6,9 @@ Does not reimplement tourism logic. Every turn calls run_agent()
 
 from __future__ import annotations
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+import json
+
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langgraph.graph import END, START, MessagesState, StateGraph
 
 from src.agent.graph import run_agent
@@ -185,12 +187,14 @@ def tourism_turn(state: MessagesState) -> dict:
     try:
         result = run_agent(request, conversation=transcript)
         content = format_chat_answer(result.get("final_response") or "")
+        events = tool_event_messages(result.get("tool_events") or [])
     except Exception as exc:
         content = (
             "I couldn't finish that just now. Nothing was invented as a crowd number.\n\n"
             f"{type(exc).__name__}: {exc}"
         )
-    return {"messages": [AIMessage(content=content)]}
+        events = []
+    return {"messages": [*events, AIMessage(content=content)]}
 
 
 def build_chat_graph():

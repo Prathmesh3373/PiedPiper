@@ -1,4 +1,5 @@
-"""Optional LLM slot filling. Does not emit visitor counts or rank scores."""
+"""Slot extraction is now handled by the brain's set_trip_context tool.
+This module is kept for backward compatibility but no longer makes a separate LLM call."""
 
 from __future__ import annotations
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from typing import Any
 
 from src.agent.dispatch import observation_text, run_named_tool
 from src.agent.model_provider import llm_enabled as _llm_enabled, make_chat_model, make_brain_model
@@ -24,6 +25,9 @@ ALLOWED_TOOLS = (
     "research_alternative",
     "optimize_trip",
 )
+from src.tools_period import assess_period_pressure
+from src.tools_recommend import find_similar_destinations, rank_alternatives
+from src.tools_web import web_search
 
 # Keep the chat UI responsive and response time low.
 MAX_BRAIN_LOOPS = 8
@@ -178,15 +182,37 @@ def _state_snapshot(state: dict) -> dict:
         "n_plan_days": len(state.get("trip_plan") or []),
     }
 
+    # 1. Dataset lookup (ASI + Kaggle)
+    profile = get_destination_profile(dest)
+    patch["profile"] = profile
+    has_asi = bool(profile.get("has_asi_history"))
+    patch["has_asi_history"] = has_asi
 
 def run_llm_tool_loop(state: dict) -> dict:
     """Model selects tools+args; Python executes them into state. Cap enforced here."""
     try:
         from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
-        from src.agent.registry import ALL_TOOLS
+    # 3. Period pressure assessment (weekends, holidays, season)
+    kaggle_meta = profile.get("kaggle") or {}
+    pressure = assess_period_pressure(
+        dest,
+        start,
+        end or start,
+        crowd_level=crowd_info.get("level"),
+        web_context=web_res,
+        dest_state=kaggle_meta.get("state"),
+        climate_zone=kaggle_meta.get("zone"),
+    )
+    patch["period_pressure"] = pressure
+
+    # 4. Alternatives & underrated places
+    try:
+        cands = find_similar_destinations(dest, interests=interests, limit=8, include_wider=True)
+        ranked = rank_alternatives(dest, candidates=cands, user_preferences={"interests": interests})
     except Exception:
-        return {"brain_source": "unavailable", "brain_ran_tools": False}
+        ranked = []
+    patch["ranked_alternatives"] = ranked
 
     working = dict(state)
     # Distinguish a Gemini-directed call from offline/direct compatibility
@@ -199,10 +225,110 @@ def run_llm_tool_loop(state: dict) -> dict:
         SystemMessage(content=BRAIN_SYSTEM),
         HumanMessage(content=json.dumps(_state_snapshot(working))),
     ]
-    ran = False
-    for step in range(MAX_BRAIN_LOOPS):
+    if has_asi and forecast_info.get("found"):
+        summary_lines.append(
+            f"- Official ASI Annual Persistence Forecast: {forecast_info.get('predicted_visitors'):,.0f} visitors ({forecast_info.get('forecast_period')})"
+        )
+        summary_lines.append(
+            f"- Relative Crowd Level: {crowd_info.get('level', 'MODERATE')} (historical quartile)"
+        )
+        if forecast_info.get("trend"):
+            summary_lines.append(f"- Recent Trend: {forecast_info.get('trend')}")
+    else:
+        summary_lines.append("- Official ASI Catalog: Destination is not in ASI annual ticketed monument panel.")
+
+    kaggle_meta = profile.get("kaggle") or {}
+    if kaggle_meta:
+        summary_lines.append(
+            f"- Catalog Metadata: State={kaggle_meta.get('state')}, Rating={kaggle_meta.get('google_rating')}, Best Season={kaggle_meta.get('season')}"
+        )
+
+    if pressure.get("found"):
+        summary_lines.append(
+            f"- Travel Window Pressure: Footfall trend is {pressure.get('footfall_direction')} "
+            f"({pressure.get('weekend_days')} weekend day(s), {pressure.get('weekday_days')} weekday(s), season={pressure.get('season')})"
+        )
+        for r in pressure.get("reasons") or []:
+            summary_lines.append(f"  • {r}")
+
+    web_hits = web_res.get("results") or []
+    if web_hits:
+        summary_lines.append("- Web Context Snippets:")
+        for h in web_hits[:3]:
+            summary_lines.append(f"  • {h.get('title')}: {(h.get('snippet') or '')[:140]}")
+
+    if ranked:
+        summary_lines.append("- Nearby Alternatives & Underrated Spots:")
+        for r in ranked[:5]:
+            dist = f"{r.get('distance_km')} km" if r.get("distance_km") else "nearby"
+            mode = "Underrated / Hidden Gem" if r.get("recommendation_mode") == "discovery" else "Alternative Heritage Site"
+            summary_lines.append(f"  • {r.get('name')} ({mode}, ~{dist}) — {'; '.join((r.get('why') or [])[:2])}")
+    else:
+        # Fallback alternatives if gazetteer had no coordinates
+        summary_lines.append(f"- Nearby Alternatives: Explore local spots and cultural heritage around {dest}.")
+
+    patch["research_summary"] = "\n".join(summary_lines)
+    return intent, patch
+
+
+def run_llm_tool_loop(state: dict) -> dict:
+    """Single-pass LLM brain: gathers all local/web research in Python, then calls Gemini
+    once to produce the complete, intelligent conversational response."""
+    working = dict(state)
+    user_req = working.get("user_request") or working.get("conversation") or ""
+
+    # Check destination and gather research
+    intent, research = gather_trip_research(working)
+    working.update(research)
+
+    if not research.get("has_destination"):
+        # No destination named yet — ask conversationally
+        working["awaiting_user"] = True
+        working["missing_slots"] = ["destination"]
+        if _llm_enabled():
+            try:
+                llm = _get_llm(temperature=0.4, max_tokens=250)
+                prompt = CLARIFICATION_PROMPT.format(
+                    user_request=user_req,
+                    conversation=working.get("conversation") or user_req,
+                )
+                msg = llm.invoke(prompt)
+                resp = _extract_text(msg)
+                working["brain_response"] = resp
+                working["pending_question"] = resp
+                working["final_response"] = resp
+                working["answer_source"] = "llm_brain"
+                working["brain_source"] = "llm"
+                return working
+            except Exception:
+                pass
+        fallback_msg = (
+            "Hey! I'd love to help you plan your trip. Which destination are you thinking of visiting? "
+            "Also let me know your planned travel dates and whether you'll be traveling solo, with family, or with friends!"
+        )
+        working["brain_response"] = fallback_msg
+        working["pending_question"] = fallback_msg
+        working["final_response"] = fallback_msg
+        working["answer_source"] = "llm_brain_clarification"
+        working["brain_source"] = "fallback"
+        return working
+
+    # Destination is present — run the LLM brain to synthesize and write conversational answer
+    if _llm_enabled():
         try:
-            msg = llm.invoke(history)
+            llm = _get_llm(temperature=0.3, max_tokens=3000)
+            prompt = BRAIN_CONVERSATIONAL_PROMPT.format(
+                research_summary=research.get("research_summary", "")
+            )
+            msg = llm.invoke(prompt)
+            resp = _extract_text(msg)
+            if resp:
+                working["brain_response"] = resp
+                working["final_response"] = resp
+                working["answer_source"] = "llm_brain"
+                working["brain_source"] = "llm"
+                working["tool_trace"] = list(working.get("tool_trace") or []) + ["llm_brain"]
+                return working
         except Exception as exc:
             working["decisions"] = list(working.get("decisions") or []) + [f"Brain LLM error: {exc}"]
             working["brain_source"] = "llm_error"
@@ -248,20 +374,4 @@ def run_llm_tool_loop(state: dict) -> dict:
 
 
 def decide_next_tools(state: dict) -> dict:
-    """Offline/fallback whitelist only. Live path uses run_llm_tool_loop."""
-    steps = int(state.get("brain_steps") or 0)
-    if steps >= MAX_BRAIN_LOOPS:
-        return {"tools": [], "done": True, "source": "cap"}
-    tools = fallback_tool_plan(state)
-    if steps > 0:
-        period = state.get("period_pressure") or {}
-        ranked = state.get("ranked_alternatives") or []
-        extra = []
-        if state.get("start_date") and not period.get("found"):
-            extra += ["web_search", "assess_period_pressure"]
-        from src.agent.research import nearby_from_research
-
-        if nearby_from_research(state).get("suggest_nearby") and not ranked:
-            extra += ["find_similar_destinations", "rank_alternatives"]
-        tools = extra
-    return {"tools": tools, "done": not tools, "source": "fallback"}
+    return {"tools": [], "done": True, "source": "single_pass"}
