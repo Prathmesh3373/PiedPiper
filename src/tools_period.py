@@ -180,6 +180,75 @@ def assess_period_pressure(
     else:
         direction = "similar"
 
+    # Compute overall crowd density level
+    if direction == "likely_higher" or crowd_level in {"HIGH", "VERY HIGH"} or (weekend_days and holiday_days):
+        crowd_density = "HIGH"
+    elif direction == "likely_lower" or crowd_level == "LOW":
+        crowd_density = "LOW"
+    else:
+        crowd_density = "MODERATE"
+
+    # Compute day-by-day score to pinpoint the most probable peak day
+    day_breakdown = []
+    best_day = None
+    best_score = -1.0
+    dest_str = (destination or "").lower()
+
+    for d in days:
+        d_score = 1.0
+        reasons = []
+        if d.weekday() == 6:  # Sunday
+            d_score += 3.0
+            reasons.append("Sunday weekend peak")
+        elif d.weekday() == 5:  # Saturday
+            d_score += 2.8
+            reasons.append("Saturday weekend rush")
+        elif d.weekday() == 4:  # Friday
+            d_score += 1.2
+            reasons.append("Pre-weekend travel")
+        else:
+            reasons.append(f"{d.strftime('%A')} weekday")
+
+        if d in INDIA_BUSY_DATES:
+            d_score += 3.5
+            reasons.append("National/Gazetted public holiday")
+
+        if event_hits:
+            d_score += 1.0
+            reasons.append("Active festival / event window")
+
+        level = "HIGH" if d_score >= 4.0 else ("MODERATE" if d_score >= 2.0 else "LOW")
+        day_breakdown.append({
+            "date": d.isoformat(),
+            "day": d.strftime("%A"),
+            "predicted_level": level,
+            "score": round(d_score, 1),
+            "reasons": reasons,
+        })
+
+        if d_score > best_score:
+            best_score = d_score
+            best_day = {
+                "date": d.isoformat(),
+                "day": d.strftime("%A"),
+                "reason": ", ".join(reasons),
+            }
+
+    # Predict peak hours and recommended visiting hours based on destination type
+    is_temple = any(k in dest_str for k in ("temple", "mandir", "mahalakshmi", "jyotiba", "kopeshwar", "darshan", "mathura", "vrindavan", "puri", "madurai", "shrine"))
+    is_viewpoint = any(k in dest_str for k in ("fort", "gad", "gadh", "point", "lake", "falls", "panhala", "sinhagad", "pratapgad", "plateau", "beach", "sunset"))
+
+    if is_temple:
+        peak_hours = "7:30 AM – 12:30 PM & 5:30 PM – 8:30 PM (Aarti & Darshan rush)"
+        recommended_hours = "5:30 AM – 7:00 AM (Early Kakad Aarti) or 2:00 PM – 4:00 PM (Midday lull)"
+    elif is_viewpoint:
+        peak_hours = "3:30 PM – 6:30 PM (Sunset & weekend afternoon influx)"
+        recommended_hours = "6:30 AM – 9:30 AM (Cool morning weather & unhindered views)"
+    else:
+        # Standard monuments / heritage sites (Taj Mahal, Qutub Minar, Hampi, Sanchi, etc.)
+        peak_hours = "10:30 AM – 3:30 PM (Tour buses, day trippers & ticketing queues)"
+        recommended_hours = "6:00 AM – 8:30 AM (Sunrise soft light & minimal queues) or 4:30 PM – 6:00 PM"
+
     return {
         "found": True,
         "destination": destination,
@@ -191,7 +260,12 @@ def assess_period_pressure(
         "holiday_dates": [d.isoformat() for d in holiday_days],
         "season": season,
         "crowd_level_annual": crowd_level,
+        "crowd_density": crowd_density,
         "footfall_direction": direction,
+        "peak_day": best_day,
+        "peak_hours": peak_hours,
+        "recommended_hours": recommended_hours,
+        "day_breakdown": day_breakdown,
         "reasons": flags,
         "layer": "HEURISTIC",
         "web_used": bool(event_hits or weather_hits),

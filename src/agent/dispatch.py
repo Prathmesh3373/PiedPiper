@@ -31,9 +31,75 @@ def _orbit_tokens(state: dict) -> list[str]:
     return list({t.lower() for t in nearby_set(dest)} | {n.lower() for n in names} | ({dest.lower()} if dest else set()))
 
 
-def _clip(payload: Any, limit: int = 8000) -> str:
+def _clip(payload: Any, limit: int = 2500) -> str:
     text = json.dumps(payload, default=str, ensure_ascii=False)
     return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _enrich_ranked_alternatives(
+    ranked: list[dict], state: dict, start: str | None, end: str | None,
+    climate_zone: str | None,
+) -> tuple[list[dict], dict[str, dict], list[str]]:
+    """Bounded data-first assessment for alternatives selected by the LLM."""
+    evidence: dict[str, dict] = {}
+    decisions: list[str] = []
+    for item in ranked:
+        name = item["name"]
+        profile = get_destination_profile(name)
+        historical = get_historical_footfall(name)
+        forecast = forecast_crowd(name)
+        level = None
+        if forecast.get("found"):
+            try:
+                level = classify_crowd(name, forecast.get("predicted_visitors"))
+            except Exception:
+                level = None
+        local_complete = bool(profile.get("kaggle")) and bool(historical.get("found"))
+        hits: list[dict] = []
+        query = None
+        provider = None
+        warnings: list[str] = []
+        if not local_complete:
+            query = f"{name} {item.get('state') or ''} {(start or '')[:7]} tourism events official".strip()
+            try:
+                out = web_search(query, domains=list(OFFICIAL_HOST_MARKERS), max_results=5)
+                hits = list(out.get("results") or [])
+                provider = out.get("provider")
+                warnings = list(out.get("warnings") or [])
+            except Exception as exc:
+                warnings = [f"web lookup unavailable: {exc}"]
+        web = structure_web_context(
+            hits, destination=name, queries=[query] if query else [], provider=provider,
+            nearby_tokens=list(nearby_set(name)), dest_state=item.get("state"),
+        )
+        if warnings:
+            web["warnings"] = list(web.get("warnings") or []) + warnings
+        pressure = {}
+        if start:
+            pressure = assess_period_pressure(
+                name, start, end or start, crowd_level=(level or {}).get("level"),
+                web_context=web, dest_state=item.get("state"), climate_zone=climate_zone,
+            )
+        evidence[name] = {
+            "profile_found": bool(profile.get("kaggle") or profile.get("asi_name")),
+            "historical": historical,
+            "forecast": forecast,
+            "crowd_level": level,
+            "used_web_fallback": not local_complete,
+            "web_context": web,
+            "period_pressure": pressure,
+        }
+        item["crowd_assessment"] = {
+            "annual_data_found": bool(forecast.get("found")),
+            "relative_level": (level or {}).get("level"),
+            "window_pressure": pressure.get("footfall_direction"),
+            "used_web_fallback": not local_complete,
+        }
+        decisions.append(
+            f"Alternative '{name}' received its own local evidence check"
+            + (" and web fallback." if not local_complete else ".")
+        )
+    return ranked, evidence, decisions
 
 
 def apply_set_trip_context(state: dict, args: dict) -> dict:
@@ -153,7 +219,13 @@ def run_named_tool(name: str, args: dict, state: dict) -> tuple[Any, dict]:
         return hist, patch
 
     if name == "forecast_crowd":
-        fc = forecast_crowd(dest, args.get("forecast_period"))
+        # Clamp any period the LLM invents (e.g. "2026-27", "2026-2027") to the
+        # latest supported period so the call never raises ValueError.
+        from src.predict import NEXT_PERIOD, FORECAST_PERIODS
+        raw_period = args.get("forecast_period") or NEXT_PERIOD
+        if raw_period not in FORECAST_PERIODS:
+            raw_period = NEXT_PERIOD
+        fc = forecast_crowd(dest, raw_period)
         forecasts = dict(state.get("forecasts") or {})
         key = fc.get("destination") or dest
         forecasts[key] = fc
@@ -297,14 +369,74 @@ def run_named_tool(name: str, args: dict, state: dict) -> tuple[Any, dict]:
             anchor,
             candidates=cands,
             forecast_context=fc_ctx if fc_ctx.get("found") else {},
-            user_preferences={"interests": interest_list, "location": location or anchor},
+            user_preferences={
+                "interests": interest_list,
+                "location": location or anchor,
+                "party_type": state.get("party_type"),
+            },
         )
-        ranked = [r for r in ranked if r.get("geo_tier") != "same_state" or (r.get("distance_km") or 999) <= 160]
+        # Only hard-drop confirmed same_state entries that are far away.
+        # None distance = unknown, not "far" — keep those so nearby
+        # ASI-circle matches and web-discovery candidates survive.
+        ranked = [
+            r for r in ranked
+            if r.get("geo_tier") != "same_state"
+            or r.get("distance_km") is None          # unknown distance → keep
+            or r.get("distance_km") <= 160
+        ]
         want_n = int((state.get("intent") or {}).get("requested_n") or 3)
         ranked = ranked[:want_n]
         patch["ranked_alternatives"] = ranked
-        patch["decisions"] = decisions + [f"Ranked {len(ranked)} orbit(s) with existing scorecard."]
+        # Offline/direct callers retain the original complete research bundle.
+        # Gemini live calls explicitly select candidates via research_alternative.
+        if state.get("brain_source") != "llm":
+            ranked, alternative_research, alt_decisions = _enrich_ranked_alternatives(
+                ranked, state, start, end, climate_zone
+            )
+            patch["ranked_alternatives"] = ranked
+            patch["alternative_research"] = alternative_research
+            patch["decisions"] = decisions + [f"Ranked {len(ranked)} orbit(s) with existing scorecard."] + alt_decisions
+            if any(v.get("used_web_fallback") for v in alternative_research.values()):
+                patch["tool_trace"] = patch["tool_trace"] + ["research_alternatives"]
+            return ranked, patch
+        patch["decisions"] = decisions + [
+            f"Ranked {len(ranked)} orbit(s). Gemini must choose which candidates receive full research."
+        ]
         return ranked, patch
+
+    if name == "research_alternative":
+        name_to_research = dest or state.get("destination") or ""
+        if not name_to_research:
+            return {"found": False, "error": "destination is required"}, patch
+        profile = get_destination_profile(name_to_research)
+        historical = get_historical_footfall(name_to_research)
+        forecast = forecast_crowd(name_to_research)
+        level = classify_crowd(name_to_research, forecast.get("predicted_visitors")) if forecast.get("found") else None
+        local_complete = bool(profile.get("kaggle") or profile.get("asi_name")) and bool(historical.get("found"))
+        hits, provider, warnings, query = [], None, [], None
+        if not local_complete:
+            query = f"{name_to_research} {dest_state or ''} {(start or '')[:7]} tourism events weather official".strip()
+            try:
+                result = web_search(query, domains=list(OFFICIAL_HOST_MARKERS), max_results=5)
+                hits, provider = list(result.get("results") or []), result.get("provider")
+                warnings = list(result.get("warnings") or [])
+            except Exception as exc:
+                warnings = [f"web lookup unavailable: {exc}"]
+        web = structure_web_context(hits, destination=name_to_research, queries=[query] if query else [], provider=provider, nearby_tokens=list(nearby_set(name_to_research)), dest_state=dest_state)
+        if warnings:
+            web["warnings"] = list(web.get("warnings") or []) + warnings
+        pressure = assess_period_pressure(name_to_research, start, end or start, crowd_level=(level or {}).get("level"), web_context=web, dest_state=dest_state, climate_zone=climate_zone) if start else {}
+        evidence = {"profile_found": bool(profile.get("kaggle") or profile.get("asi_name")), "historical": historical, "forecast": forecast, "crowd_level": level, "used_web_fallback": not local_complete, "web_context": web, "period_pressure": pressure}
+        researched = dict(state.get("alternative_research") or {})
+        researched[name_to_research] = evidence
+        patch["alternative_research"] = researched
+        patched_ranked = list(state.get("ranked_alternatives") or [])
+        for item in patched_ranked:
+            if item.get("name", "").lower() == name_to_research.lower():
+                item["crowd_assessment"] = {"annual_data_found": bool(forecast.get("found")), "relative_level": (level or {}).get("level"), "window_pressure": pressure.get("footfall_direction"), "used_web_fallback": not local_complete}
+        patch["ranked_alternatives"] = patched_ranked
+        patch["decisions"] = decisions + [f"Gemini selected alternative '{name_to_research}' for catalog-first research" + (" with web gap-filling." if not local_complete else ".")]
+        return evidence, patch
 
     if name == "optimize_trip":
         must = list(state.get("must_visit") or [])

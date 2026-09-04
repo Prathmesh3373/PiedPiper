@@ -66,6 +66,7 @@ def _print_run(request: str, verbose: bool) -> None:
             "destination": state.get("destination"),
             "start_date": state.get("start_date"),
             "end_date": state.get("end_date"),
+            "party_type": state.get("party_type"),
             "interests": state.get("interests"),
             "must_visit": state.get("must_visit"),
             "intent": state.get("intent"),
@@ -81,9 +82,22 @@ def _print_run(request: str, verbose: bool) -> None:
                 for k, v in (state.get("crowd_levels") or {}).items()
             },
             "ranked_alternatives": [
-                {"name": r.get("name"), "final_score": r.get("final_score")}
+                {
+                    "name": r.get("name"),
+                    "final_score": r.get("final_score"),
+                    "party_fit": (r.get("components") or {}).get("party_fit"),
+                    "crowd_assessment": r.get("crowd_assessment"),
+                }
                 for r in (state.get("ranked_alternatives") or [])[:3]
             ],
+            "alternative_research": {
+                name: {
+                    "used_web_fallback": (facts or {}).get("used_web_fallback"),
+                    "forecast_found": ((facts or {}).get("forecast") or {}).get("found"),
+                    "window_pressure": ((facts or {}).get("period_pressure") or {}).get("footfall_direction"),
+                }
+                for name, facts in (state.get("alternative_research") or {}).items()
+            },
             "trip_plan": state.get("trip_plan"),
         }
         print(json.dumps(slim, indent=2, default=str))

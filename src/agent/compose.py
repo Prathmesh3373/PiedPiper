@@ -1,33 +1,80 @@
-"""Traveler-facing answer. Live path: OpenAI writes from tool facts. Offline: template."""
+"""Traveler-facing answer. Live path: Gemini writes from tool facts. Offline: template."""
 
 from __future__ import annotations
 
 import json
 import os
 
+from src.agent.model_provider import llm_enabled, make_chat_model
 from src.agent.reasoning import build_decision_reasoning
 from src.agent.research import nearby_from_research
 from src.agent.state import TourismState
 
-ANSWER_SYSTEM = """You are chatting with the traveler. Write like a helpful person, not a report generator and not a form.
+ANSWER_SYSTEM = """You are an expert, warm travel-crowd advisor for SIH 2026 — chatting naturally with a traveler.
+Write like a knowledgeable friend, not a system log. Clean Markdown, structured but never robotic.
 
-RESEARCH_FACTS is the only evidence.
+RESEARCH_FACTS below is your ONLY ground truth. Do not invent numbers, URLs, or event names not present in RESEARCH_FACTS.
 
-If awaiting_user is true and there are no forecasts:
-- Only continue the conversation. Ask for missing_slots / pending_question.
-- Do not dump a crowd report. Do not invent a place, dates, or party.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+IF awaiting_user = true  (missing slots)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Ask ONLY the single most important missing piece (destination, dates, or travel party).
+Keep it warm and conversational — 1–2 sentences max.
 
-If awaiting_user is true AND forecasts or ranked places exist:
-- Share those findings in conversation, then ask the missing dates/party naturally.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+IF research ran  (forecasts or period_pressure present)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Structure your answer with these sections, in order:
 
-If research ran:
-- Talk naturally: acknowledge what they said (place, dates, family/friends/solo).
-- Say whether pressure for THEIR dates looks higher or not, using the research bundle (catalog history if any, season, weekends, events, weather). Annual HIGH is not the only reason.
-- Do not invent visitor counts. If found=false, say we have no official ASI series.
-- Copy visitor numbers from facts exactly if present.
-- Nearby names only from ranked_alternatives. Offer them as suggestions in conversation.
-- Mention a loose schedule only if trip_plan exists.
-- Keep it short enough to feel like chat. One or two follow-up questions are welcome if something is still missing.
+**1. Trip Overview**
+Acknowledge destination, travel dates, and party type naturally in 1–2 sentences.
+Example: "Planning a family trip to Hampi from Oct 10–13 — great choice!"
+
+**2. Crowd Density Verdict**
+Lead with a clear verdict badge: 🔴 HIGH | 🟡 MODERATE | 🟢 LOW
+Then give crisp reasoning (3–5 bullet points max) covering:
+- Weather conditions during that window (from web facts if available)
+- Active festivals, fairs, or events overlapping the dates (from web facts only — never invent)
+- Weekend / public holiday overlap in the travel window
+- Season classification (peak tourist season vs off-peak vs monsoon)
+- Historical footfall trend (increasing / stable / decreasing) if ASI data was found
+
+**3. Timing Intelligence**
+📅 **Most Probable Peak Day:** [Day, Date] — [1-line reason]
+⏰ **Peak Rush Hours:** [hours to avoid] — [1-line why]
+💡 **Best Time to Visit:** [optimal window] — [1-line why]
+
+**4. Smart Alternatives** *(always include, even if crowd is low)*
+
+🌟 **Popular Alternatives** (well-known, manageable crowds)
+For each (2–3 places):
+- **[Name]** — [distance if available] | Crowd: [level or "discovery"]
+  Peak hours: [hours] | Best visit: [hours]
+  [1-line why it's a good swap or complement]
+
+💎 **Hidden Gems** (underrated, off-beat, peaceful)
+For each (2–3 places):
+- **[Name]** — [distance if available] | Why it's special: [1-line]
+  Best visit: [hours]
+
+> 🗺️ **Tip:** Click any recommended destination in the dashboard to open an interactive side-map showing pinned locations, distances, and suggested routes!
+
+**5. Smart Tips for Your Trip**
+Give 2–3 party-specific tips:
+- Family → kid-friendly pacing, shade/rest spots, entry ticket info
+- Solo → photography golden hours, quiet corners, self-guided trails
+- Friends → group photo spots, nearby food/chai stops, adventure add-ons
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Never invent visitor counts, occupancy %, or hourly headcounts.
+- Only mention an event/festival if it appears in the web facts section of RESEARCH_FACTS.
+- Crowd level comes from crowd_density in period_pressure (HIGH/MODERATE/LOW), not from your own guess.
+- Peak day and hours come from peak_day, peak_hours, recommended_hours in period_pressure.
+- For alternatives: use the ranked_alternatives list. Popular = is_underrated: false. Hidden gem = is_underrated: true.
+- If no ASI data exists, say so honestly; still give timing and alternatives from web/heuristic evidence.
+- Keep total response under ~600 words. Structured, scannable, warm.
 """
 
 
@@ -172,6 +219,15 @@ def compose_final_response(state: TourismState) -> str:
             f"{pressure.get('weekend_days')} weekend / {pressure.get('weekday_days')} weekday)"
         )
         lines.append(f"Season (heuristic): {pressure.get('season')}")
+        if pressure.get("crowd_density"):
+            lines.append(f"Overall Predicted Crowd Density: {pressure.get('crowd_density')}")
+        if pressure.get("peak_day"):
+            pd = pressure.get("peak_day") or {}
+            lines.append(f"Most Probable Peak Day: {pd.get('day')} ({pd.get('date')}) — {pd.get('reason')}")
+        if pressure.get("peak_hours"):
+            lines.append(f"Peak Rush Hours: {pressure.get('peak_hours')}")
+        if pressure.get("recommended_hours"):
+            lines.append(f"Recommended Best Visiting Hours: {pressure.get('recommended_hours')}")
         if pressure.get("holiday_dates"):
             lines.append("Holidays in window: " + ", ".join(pressure["holiday_dates"]))
         lines.append(
@@ -270,10 +326,24 @@ def _answer_facts(state: TourismState) -> dict:
             {
                 "name": r.get("name"),
                 "distance_km": r.get("distance_km"),
+                "city": r.get("city"),
+                "state": r.get("state"),
+                # Coordinates for map rendering in the side-tab
+                "lat": r.get("lat"),
+                "lng": r.get("lng"),
+                # Dual-tier classification
+                "is_underrated": bool(r.get("is_underrated")),
+                "category": r.get("category") or ("underrated" if r.get("is_underrated") else "popular"),
+                # Timing
+                "peak_hours": r.get("peak_hours"),
+                "recommended_hours": r.get("recommended_hours"),
+                # Evidence
                 "why": (r.get("why") or [])[:4],
                 "recommendation_mode": r.get("recommendation_mode"),
                 "predicted_visitors": r.get("predicted_visitors"),
                 "crowd_data_available": r.get("crowd_data_available"),
+                "crowd_assessment": r.get("crowd_assessment"),
+                "final_score": r.get("final_score"),
             }
         )
     hist = {}
@@ -321,6 +391,10 @@ def _answer_facts(state: TourismState) -> dict:
             "weekday_days": (state.get("period_pressure") or {}).get("weekday_days"),
             "holiday_dates": (state.get("period_pressure") or {}).get("holiday_dates"),
             "footfall_direction": (state.get("period_pressure") or {}).get("footfall_direction"),
+            "crowd_density": (state.get("period_pressure") or {}).get("crowd_density"),
+            "peak_day": (state.get("period_pressure") or {}).get("peak_day"),
+            "peak_hours": (state.get("period_pressure") or {}).get("peak_hours"),
+            "recommended_hours": (state.get("period_pressure") or {}).get("recommended_hours"),
             "reasons": (state.get("period_pressure") or {}).get("reasons"),
         },
         "web": {
@@ -332,42 +406,130 @@ def _answer_facts(state: TourismState) -> dict:
         },
         "nearby_from_research": nearby_from_research(state),
         "ranked_alternatives": ranked,
+        "popular_alternatives": [r for r in ranked if not r.get("is_underrated")],
+        "underrated_alternatives": [r for r in ranked if r.get("is_underrated")],
+        "alternative_research": {
+            name: {
+                "used_web_fallback": (facts or {}).get("used_web_fallback"),
+                "forecast_found": ((facts or {}).get("forecast") or {}).get("found"),
+                "window_pressure": ((facts or {}).get("period_pressure") or {}).get("footfall_direction"),
+            }
+            for name, facts in (state.get("alternative_research") or {}).items()
+        },
         "trip_plan": state.get("trip_plan") or [],
     }
 
 
 def llm_write_answer(state: TourismState) -> str | None:
+    """Ask Gemini to write the final conversational answer from collected evidence.
+
+    Retries once on transient server errors (503 / 429 with retry-after).
+    Returns None only when the error is permanent (bad key, quota exhausted for the day)
+    so compose_answer() can fall back to the deterministic template.
+    """
+    import time as _time
+
     if os.environ.get("TOURISM_LLM_BRAIN", "1") != "1":
         return None
-    if not (os.getenv("OPENAI_API_KEY") or "").strip():
+    if not llm_enabled():
         return None
     try:
         from langchain_core.messages import HumanMessage, SystemMessage
-        from langchain_openai import ChatOpenAI
     except Exception:
         return None
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    llm = ChatOpenAI(model=model, temperature=0.45, max_tokens=900)
-    try:
-        msg = llm.invoke(
-            [
-                SystemMessage(content=ANSWER_SYSTEM),
-                HumanMessage(content=json.dumps(_answer_facts(state), default=str)[:14000]),
-            ]
+
+    facts_json = json.dumps(_answer_facts(state), default=str)[:14000]
+    messages = [
+        SystemMessage(content=ANSWER_SYSTEM),
+        HumanMessage(content=facts_json),
+    ]
+
+    last_exc: Exception | None = None
+    for attempt in range(3):           # up to 3 attempts
+        try:
+            llm = make_chat_model(temperature=0.45, max_tokens=1400)
+            msg = llm.invoke(messages)
+            text = (msg.content or "").strip()
+            if text:
+                return text
+            # Empty string from Gemini — treat as transient, retry once
+            if attempt < 2:
+                _time.sleep(2)
+                continue
+            return None
+        except Exception as exc:
+            last_exc = exc
+            err_str = str(exc)
+            # 503 UNAVAILABLE or 429 with a retry-after → wait and retry
+            if ("503" in err_str or "UNAVAILABLE" in err_str):
+                wait = 5 * (attempt + 1)
+                _time.sleep(wait)
+                continue
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                # Per-minute rate limit — short wait then try again once
+                if attempt == 0:
+                    _time.sleep(15)
+                    continue
+                # Daily quota exhausted — no point retrying
+                return None
+            # Any other error (bad key, network etc) — fall through to template
+            return None
+    return None
+
+
+def _conversational_fallback(state: TourismState) -> str:
+    """Short traveler-facing answer when the live writer is unavailable."""
+    dest = state.get("destination") or "your destination"
+    party = state.get("party_type")
+    start, end = state.get("start_date"), state.get("end_date")
+    forecasts = state.get("forecasts") or {}
+    crowds = state.get("crowd_levels") or {}
+    pressure = state.get("period_pressure") or {}
+    ranked = state.get("ranked_alternatives") or []
+    found = next((v for v in forecasts.values() if (v or {}).get("found")), None)
+    trip = f" for your {party} trip" if party else ""
+    dates = f" from {start} to {end or start}" if start else ""
+
+    if not found:
+        return (
+            f"I couldn't complete the live analysis for {dest}{trip}{dates} just now. "
+            "I have not guessed a crowd number. Please try again in a moment."
         )
-        text = (msg.content or "").strip()
-        return text or None
-    except Exception:
-        return None
+
+    name = found.get("destination") or dest
+    level = (crowds.get(name) or crowds.get(dest) or {}).get("level") or "unknown"
+    answer = (
+        f"For {name}{trip}{dates}, the available ASI annual history indicates a "
+        f"{level.lower()} relative crowd level."
+    )
+    if pressure.get("found"):
+        direction = pressure.get("footfall_direction") or "similar"
+        answer += f" Your travel window looks {direction.replace('_', ' ')} than its usual annual baseline."
+    if ranked:
+        names = ", ".join(str(item.get("name")) for item in ranked[:3] if item.get("name"))
+        if names:
+            answer += f" If you prefer alternatives, consider {names}."
+    answer += " I can refine this further when the live research connection is available."
+    return answer
 
 
 def compose_answer(state: TourismState) -> str:
-    """Live: OpenAI conversation from tool facts. Offline: template. Asks stay questions."""
+    """Live: Gemini conversation from tool facts. Offline: template. Asks stay questions."""
+    if state.get("brain_source") == "gemini_unavailable":
+        return (
+            "I need the Gemini brain to continue this conversation. Please set GEMINI_API_KEY "
+            "and keep TOURISM_LLM_PROVIDER=gemini, then try again."
+        )
+    if state.get("awaiting_user") and (state.get("pending_question") or "").strip():
+        return str(state["pending_question"]).strip()
+    # Only fall back to short template on hard errors — NOT on llm_cap.
+    # llm_cap means the brain ran all loops and gathered full evidence; Gemini
+    # should still write the final answer from that evidence.
+    if state.get("brain_source") == "llm_error":
+        return _conversational_fallback(state)
     live = llm_write_answer(state)
     if live:
         return live
-    if state.get("awaiting_user") and (state.get("pending_question") or "").strip():
-        return str(state["pending_question"]).strip()
     return compose_final_response(state)
 
 

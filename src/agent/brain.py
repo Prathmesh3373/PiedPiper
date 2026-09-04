@@ -1,12 +1,12 @@
-"""OpenAI brain owns tool choice and arguments. Python only executes whitelist tools."""
+"""Gemini owns tool choice and arguments. Python only executes safe evidence tools."""
 
 from __future__ import annotations
 
 import json
-import os
 import re
 
 from src.agent.dispatch import observation_text, run_named_tool
+from src.agent.model_provider import llm_enabled as _llm_enabled, make_chat_model, make_brain_model
 
 ALLOWED_TOOLS = (
     "clarify_with_user",
@@ -21,36 +21,90 @@ ALLOWED_TOOLS = (
     "assess_period_pressure",
     "find_similar_destinations",
     "rank_alternatives",
+    "research_alternative",
     "optimize_trip",
 )
 
-MAX_BRAIN_LOOPS = 10
+# Keep the chat UI responsive and response time low.
+MAX_BRAIN_LOOPS = 8
 MAX_CALLS_PER_STEP = 4
 
-BRAIN_SYSTEM = """You are a travel-research advisor in a live conversation. You decide every next step.
-Python only executes tools (ASI + Kaggle catalogs, web search, ranking, trip sketch). You decide whether to ask, research, predict, recommend, or stop.
+BRAIN_SYSTEM = """You are the autonomous AI travel-crowd advisor brain for SIH 2026 — a friendly, expert guide who NEVER waits for human intervention except for privacy/security concerns.
 
-Conversation first:
-- Read the full transcript. Destination is required before any crowd claim.
-- If there is NO place yet, call clarify_with_user only. Ask where they want to go, and also dates and family/friends/solo if unknown.
-- If a place IS named but dates or party are missing: still research that place. Ask for dates/party in the spoken reply (clarify_with_user after research, or leave it for the chat turn). Do not skip ASI/Kaggle lookup just because dates are missing.
-- Do not re-ask what they already answered.
+═══════════════════════════════════════════════════════
+CORE PRINCIPLE: You run the full research pipeline autonomously. Every tool-calling decision is yours. Keep it snappy — gather enough facts, then stop and let the answer be composed.
+═══════════════════════════════════════════════════════
 
-Research (only after you have a place; dates/party help but you may research the place and still ask for missing dates/party if needed):
-1) Catalog first: search_destinations + get_destination_profile on the place, city, state, aliases.
-   If found: get_historical_footfall, forecast_crowd, classify_crowd. Use whatever features the tools return (season in profile, ratings, etc.).
-2) Gaps: if not in catalog, or weather/events/holidays/festivals for the window are missing, YOU write web_search queries (official name + aliases). Then extract_nearby_places if useful. assess_period_pressure for weekdays/weekends/season/holidays vs the annual figure — not a new daily count.
-3) YOU decide if research is enough. If not, call more tools. If you still lack dest/dates/party, ask the user instead of guessing.
+STEP 1 — SLOT COLLECTION (conversational, one question at a time)
+────────────────────────────────────────────────────────────────
+You need exactly THREE things before researching:
+  (a) Destination  — monument, city, fort, district, or region
+  (b) Travel dates — start and end date (even approximate is fine: "first week of October")
+  (c) Travel party — solo | family | friends
 
-Prediction for THEIR window:
-- Combine annual history (if any) with window/season/weekends/events/weather. Say if footfall pressure looks higher or not. Never invent a visitor total. found=false → no ASI number.
+Rules:
+- Call set_trip_context as soon as destination is clear (even if dates/party are still missing).
+- If ANY of the three are genuinely missing from the conversation, call clarify_with_user with ONE warm, specific question covering the most important missing item.
+- NEVER ask for something the user already mentioned. NEVER ask multiple questions at once.
+- Once all three are known, proceed immediately to Step 2 — do NOT ask for confirmation.
 
-If pressure looks higher from that full research (not only annual HIGH):
-- find_similar / extract_nearby / rank_alternatives. Same research on those names when possible.
+STEP 2 — DATASET-FIRST RESEARCH
+────────────────────────────────
+Always check local data before hitting the web. This keeps responses fast and grounded.
 
-Then stop so the reply can be written. Or clarify_with_user if you need the traveler to talk.
+  A. If destination is in our dataset:
+     1. search_destinations  → verify the name
+     2. get_destination_profile  → type, state, zone, ratings
+     3. get_historical_footfall  → official ASI annual visitor history
+     4. forecast_crowd  → persistence prediction for next period
+     5. classify_crowd  → LOW / MODERATE / HIGH / VERY HIGH relative level
 
-Never invent visitor counts. Distant same-state cities are not nearby.
+  B. Fill in dynamic features that the dataset cannot provide:
+     - Weather conditions for the travel window → web_search("{destination} weather {month} {year}")
+     - Upcoming festivals, fairs, events in that period → web_search("{destination} festivals events {month} {year}")
+     - National/regional holidays overlapping the dates → already handled by assess_period_pressure
+     - Official timings or closures → web_search if relevant
+
+  C. If destination is NOT in our dataset at all:
+     - Run web_search to build the place profile, discover type/season/popularity
+     - Then continue with assess_period_pressure and alternatives
+
+  D. Always call assess_period_pressure once web + local data is ready — it synthesises:
+     • Overall crowd density (HIGH / MODERATE / LOW)
+     • Most probable peak day with reason
+     • Peak rush hours to avoid
+     • Best low-crowd visiting hours
+     Never skip this step when dates are known.
+
+STEP 3 — CROWD DENSITY CONCLUSION + DUAL-TIER ALTERNATIVES
+─────────────────────────────────────────────────────────────
+After assess_period_pressure completes:
+  - Determine if crowd is HIGH, MODERATE, or LOW for the travel window.
+  - ALWAYS recommend alternatives regardless of crowd level (users appreciate options).
+  - Call find_similar_destinations → rank_alternatives.
+    rank_alternatives automatically tags each result as:
+      🌟 Popular Alternative  (well-known, lower relative footfall than anchor)
+      💎 Underrated / Hidden Gem  (lesser-known, discovery mode, peaceful ambience)
+  - For the top 1–2 alternatives only, call research_alternative to verify their details.
+  - STOP tool calls after that. Do not loop more than 6 times total.
+
+STEP 4 — WHEN TO STOP
+──────────────────────
+Stop calling tools when you have:
+  ✓ Trip context set (destination, dates, party)
+  ✓ Local data checked (profile + history + forecast + crowd level) OR web fallback done
+  ✓ Web dynamic features fetched (weather, events, holidays)
+  ✓ assess_period_pressure result
+  ✓ At least 2–3 ranked alternatives
+Then return — the answer composer will write the final response from your evidence.
+
+EFFICIENCY RULES
+────────────────
+- MAX 6 tool-call loops total. Make parallel calls (up to 4 per step) when possible.
+- Do NOT call web_search more than 3 times per request.
+- Do NOT call research_alternative for more than 2 candidates.
+- Never invent visitor counts, occupancy %, or hourly headcounts.
+- Never fabricate URLs or event names.
 """
 
 
@@ -62,44 +116,20 @@ def canonical_tool_name(name: str) -> str:
 
 
 def fallback_tool_plan(state: dict) -> list[str]:
-    intent = state.get("intent") or {}
-    dest = state.get("destination")
-    start = state.get("start_date")
+    """Minimal offline fallback. Live path uses run_llm_tool_loop — Gemini decides everything.
+    This only fires when TOURISM_LLM_BRAIN=0 (test/offline mode).
+    We do the absolute minimum: web search for context + period pressure if dates exist.
+    """
     tools: list[str] = []
-    if dest and (intent.get("needs_prediction") or not intent.get("needs_trip_plan")):
-        if intent.get("needs_prediction") or dest:
-            if intent.get("needs_prediction"):
-                tools += ["forecast_crowd", "classify_crowd"]
-    if intent.get("needs_trip_plan") or intent.get("needs_prediction"):
-        if dest and "forecast_crowd" not in tools and intent.get("needs_prediction"):
-            tools += ["forecast_crowd", "classify_crowd"]
-    if start or intent.get("needs_current_context"):
-        tools.append("web_search")
-        if start:
-            tools.append("assess_period_pressure")
-    from src.agent.planner import KNOWN_FORECAST_SITES
-
-    if dest and dest not in KNOWN_FORECAST_SITES:
-        who_only = (
-            intent.get("needs_current_context")
-            and not intent.get("needs_prediction")
-            and not intent.get("needs_trip_plan")
-            and not intent.get("needs_alternatives")
-        )
-        if not who_only:
+    if state.get("start_date"):
+        if "web_search" not in (state.get("tool_trace") or []):
             tools.append("web_search")
-            tools += ["find_similar_destinations", "rank_alternatives"]
-    if intent.get("needs_alternatives") or intent.get("needs_trip_plan"):
-        tools += ["find_similar_destinations", "rank_alternatives"]
-    if intent.get("needs_trip_plan"):
-        tools.append("optimize_trip")
-    seen = set()
-    out = []
-    for t in tools:
-        if t in ALLOWED_TOOLS and t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
+        if "assess_period_pressure" not in (state.get("tool_trace") or []):
+            tools.append("assess_period_pressure")
+    if not tools and state.get("destination"):
+        tools.append("web_search")
+    seen: set[str] = set()
+    return [t for t in tools if t in ALLOWED_TOOLS and not seen.add(t)]  # type: ignore[func-returns-value]
 
 
 def _parse_llm_json(raw: str) -> dict | None:
@@ -111,12 +141,6 @@ def _parse_llm_json(raw: str) -> dict | None:
     except json.JSONDecodeError:
         return None
     return data if isinstance(data, dict) else None
-
-
-def _llm_enabled() -> bool:
-    if os.environ.get("TOURISM_LLM_BRAIN", "1") != "1":
-        return False
-    return bool((os.getenv("OPENAI_API_KEY") or "").strip())
 
 
 def _state_snapshot(state: dict) -> dict:
@@ -144,6 +168,10 @@ def _state_snapshot(state: dict) -> dict:
         },
         "crowd_levels": {k: (v or {}).get("level") for k, v in (state.get("crowd_levels") or {}).items()},
         "period_pressure": (state.get("period_pressure") or {}).get("footfall_direction"),
+        "crowd_density": (state.get("period_pressure") or {}).get("crowd_density"),
+        "peak_day": (state.get("period_pressure") or {}).get("peak_day"),
+        "peak_hours": (state.get("period_pressure") or {}).get("peak_hours"),
+        "recommended_hours": (state.get("period_pressure") or {}).get("recommended_hours"),
         "n_web_hits": len(state.get("web_raw_hits") or []),
         "n_candidates": len(state.get("candidate_alternatives") or []),
         "n_ranked": len(state.get("ranked_alternatives") or []),
@@ -155,17 +183,18 @@ def run_llm_tool_loop(state: dict) -> dict:
     """Model selects tools+args; Python executes them into state. Cap enforced here."""
     try:
         from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
-        from langchain_openai import ChatOpenAI
 
         from src.agent.registry import ALL_TOOLS
     except Exception:
         return {"brain_source": "unavailable", "brain_ran_tools": False}
 
     working = dict(state)
+    # Distinguish a Gemini-directed call from offline/direct compatibility
+    # calls without changing the model's authority over the live workflow.
+    working["brain_source"] = "llm"
     working.setdefault("decisions", [])
     working.setdefault("tool_trace", [])
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    llm = ChatOpenAI(model=model, temperature=0, max_tokens=900).bind_tools(ALL_TOOLS)
+    llm = make_brain_model(max_tokens=1200).bind_tools(ALL_TOOLS)
     history: list = [
         SystemMessage(content=BRAIN_SYSTEM),
         HumanMessage(content=json.dumps(_state_snapshot(working))),
@@ -176,6 +205,7 @@ def run_llm_tool_loop(state: dict) -> dict:
             msg = llm.invoke(history)
         except Exception as exc:
             working["decisions"] = list(working.get("decisions") or []) + [f"Brain LLM error: {exc}"]
+            working["brain_source"] = "llm_error"
             break
         history.append(msg)
         calls = list(getattr(msg, "tool_calls", None) or [])

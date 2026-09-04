@@ -124,14 +124,44 @@ def _trim_alt_debug(body: str) -> str:
     return "\n".join(keep).strip()
 
 
+def _looks_like_template(text: str) -> bool:
+    """Detect the old deterministic ALL-CAPS template (starts with a section header
+    on its own line, e.g. 'CONCLUSION\\n' or 'CROWD FORECAST\\n').
+
+    Gemini's free-form Markdown answers start with **, #, or prose — they never
+    start a bare line with one of these exact labels followed by a newline.
+    We check for the header *at the start of a line* followed by a newline or
+    end-of-string, so a word like CONCLUSION inside Gemini prose won't trigger it.
+    """
+    import re
+    for name in _CHAT_TITLES:
+        # Must appear at the very start of a line (^) as the complete line content
+        if re.search(r"(^|\n)" + re.escape(name) + r"\s*\n", text):
+            return True
+    return False
+
+
 def format_chat_answer(raw: str) -> str:
-    """Chat bubble. LLM answers are shown as written; template answers stay sectioned."""
+    """Chat bubble formatter.
+
+    - Gemini free-form Markdown answers (the normal live path) are returned as-is.
+      They already contain well-structured headers, bullets, and emoji — no re-wrapping needed.
+    - Old deterministic template responses (ALL-CAPS section names) are split and
+      re-titled for cleaner rendering in the LangGraph chat UI.
+    """
     text = (raw or "").strip()
     if not text:
         return "(no response from tourism agent)"
+
+    # Live Gemini path: pass through unchanged.
+    if not _looks_like_template(text):
+        return text
+
+    # Deterministic template path: split into titled sections.
     sections = _split_agent_sections(text)
     if not sections:
         return text
+
     parts: list[str] = []
     for key in _CHAT_SECTION_ORDER:
         body = sections.get(key)
@@ -141,7 +171,7 @@ def format_chat_answer(raw: str) -> str:
             body = _trim_alt_debug(body)
         title = _CHAT_TITLES[key]
         parts.append(f"## {title}\n\n{body}")
-    return "\n\n".join(parts).strip()
+    return "\n\n".join(parts).strip() or text
 
 
 def tourism_turn(state: MessagesState) -> dict:

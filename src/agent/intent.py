@@ -261,6 +261,15 @@ def _destination(raw: str, lower: str) -> str | None:
         token = new_to.group(1).strip()
         if token and token.split()[0] not in skip_dest:
             return " ".join(w.capitalize() for w in token.split())
+    trip_to = re.search(
+        r"\b(?:go(?:ing)?|travel(?:ling)?|visit(?:ing)?|trip)\s+(?:to\s+)?"
+        r"([a-z][a-z\s]{1,40}?)(?=\s+(?:with|from|on|during|between|for)\b|[,.?]|$)",
+        lower,
+    )
+    if trip_to:
+        token = trip_to.group(1).strip()
+        if token and token.split()[0] not in skip_dest:
+            return " ".join(w.capitalize() for w in token.split() if w not in skip)
     fort = re.search(r"\b([a-z][a-z]+(?:gad|gadh|pur)?)\s+fort\b", lower)
     if fort:
         return fort.group(1).title()
@@ -299,6 +308,13 @@ def extract_intent(text: str) -> dict:
     dest = _destination(raw, lower)
     must = [n for n in ["Mahalakshmi", "Jyotiba", "Panhala"] if n.lower() in lower]
     interests = [w for w in ["temples", "forts", "nature", "heritage", "spiritual", "beaches"] if w in lower]
+    party_type = None
+    if re.search(r"\b(solo|alone|by myself|on my own)\b", lower):
+        party_type = "solo"
+    elif re.search(r"\b(with (my )?family|family trip|with kids|with children)\b", lower):
+        party_type = "family"
+    elif re.search(r"\b(with (my )?friends|friends trip|with friends)\b", lower):
+        party_type = "friends"
 
     if needs_trip_plan:
         needs_alternatives = True
@@ -325,6 +341,7 @@ def extract_intent(text: str) -> dict:
         "end_date": end,
         "interests": interests,
         "must_visit": must,
+        "party_type": party_type,
         "intent": flags,
         "is_multi_day": bool(start and end),
         "wants_hourly": wants_hourly,
@@ -367,6 +384,9 @@ def resolve_intent(text: str, use_llm: bool = True) -> dict:
     if slots.get("must_visit"):
         extra = [str(x) for x in slots["must_visit"] if x]
         base["must_visit"] = list(dict.fromkeys(list(base.get("must_visit") or []) + extra))
+    party = slots.get("party_type")
+    if isinstance(party, str) and party.strip().lower() in {"family", "friends", "solo"}:
+        base["party_type"] = party.strip().lower()
     flags = dict(base.get("intent") or {})
     for key in (
         "needs_prediction",
