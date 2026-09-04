@@ -113,12 +113,15 @@ class BrainControlTests(unittest.TestCase):
             out = parse_intent({"messages": [HumanMessage(content="Belgaon with family")]})
         self.assertIn("Belgaon", out.get("user_request") or "")
 
-    def test_live_parse_does_not_lock_place_before_openai(self):
+    def test_live_parse_retains_trip_slots_when_openai_is_enabled(self):
         from unittest.mock import patch
 
         from src.agent.graph import parse_intent
 
         with patch("src.agent.graph._llm_enabled", return_value=True):
-            out = parse_intent({"user_request": "Belgaon trip 20 to 23 Feb 2026 crowd and nearby"})
-        self.assertIsNone(out.get("destination"))
-        self.assertEqual(out.get("intent"), {})
+            out = parse_intent(
+                {"user_request": "Belgaon trip 20 to 23 Feb 2026 with my family, crowd and nearby"}
+            )
+        self.assertEqual(out.get("destination"), "Belgaon")
+        self.assertEqual(out.get("party_type"), "family")
+        self.assertEqual(out.get("start_date"), "2026-02-20")

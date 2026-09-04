@@ -86,6 +86,104 @@ def _merge_web(
     )
 
 
+def _research_ranked_alternatives(
+    ranked: list[dict],
+    *,
+    start: str | None,
+    end: str | None,
+    climate_zone: str | None,
+    official_domains: list[str],
+    search_web,
+) -> tuple[list[dict], dict[str, dict], list[dict], list[str]]:
+    """Give each displayed alternative its own data-first evidence bundle.
+
+    This is deliberately bounded to already-ranked places: we do not spend web
+    requests researching candidates that will never be shown to the traveler.
+    """
+    researched: dict[str, dict] = {}
+    sources: list[dict] = []
+    decisions: list[str] = []
+    for item in ranked:
+        name = item["name"]
+        profile = get_destination_profile(name)
+        historical = get_historical_footfall(name)
+        forecast = forecast_crowd(name)
+        classification = _safe_classify(
+            forecast.get("destination") or name, forecast.get("predicted_visitors")
+        ) if forecast.get("found") else None
+
+        # A metadata row plus ASI history is enough local evidence. Everything
+        # else gets an official-first current-context lookup before presentation.
+        local_complete = bool(profile.get("kaggle")) and bool(historical.get("found"))
+        hits: list[dict] = []
+        query = None
+        provider = None
+        warning = None
+        if not local_complete:
+            month = start[:7] if start else ""
+            query = f"{name} {item.get('state') or ''} {month} tourism events official".strip()
+            try:
+                web = search_web(query, official_domains)
+                hits = list(web.get("results") or [])
+                provider = web.get("provider")
+                warning = "; ".join(web.get("warnings") or []) or None
+            except Exception as exc:
+                warning = f"web lookup unavailable: {exc}"
+        web_context = _merge_web(
+            hits,
+            name,
+            [query] if query else [],
+            provider,
+            list(nearby_set(name)),
+            item.get("state"),
+        )
+        if warning:
+            web_context["warnings"] = list(web_context.get("warnings") or []) + [warning]
+        pressure = {}
+        if start:
+            pressure = assess_period_pressure(
+                name,
+                start,
+                end or start,
+                crowd_level=(classification or {}).get("level"),
+                web_context=web_context,
+                dest_state=item.get("state"),
+                climate_zone=climate_zone,
+            )
+        for hit in web_context.get("results") or []:
+            if hit.get("url"):
+                sources.append(
+                    {
+                        "title": hit.get("title"),
+                        "url": hit.get("url"),
+                        "domain": hit.get("source"),
+                        "evidence_tier": hit.get("evidence_tier"),
+                        "snippet": hit.get("snippet"),
+                    }
+                )
+        evidence = {
+            "profile_found": bool(profile.get("kaggle") or profile.get("asi_name")),
+            "historical": historical,
+            "forecast": forecast,
+            "crowd_level": classification,
+            "used_web_fallback": not local_complete,
+            "web_context": web_context,
+            "period_pressure": pressure,
+        }
+        researched[name] = evidence
+        item["crowd_assessment"] = {
+            "annual_data_found": bool(forecast.get("found")),
+            "relative_level": (classification or {}).get("level"),
+            "window_pressure": pressure.get("footfall_direction"),
+            "used_web_fallback": not local_complete,
+        }
+        decisions.append(
+            f"Alternative '{name}': local profile/history checked"
+            + ("; official web fallback used for missing evidence." if not local_complete else ".")
+        )
+    return ranked, researched, sources, decisions
+
+
 def execute_plan(state: TourismState) -> dict:
     intent = dict(state.get("intent") or {})
     dest = state.get("destination")
@@ -110,6 +208,7 @@ def execute_plan(state: TourismState) -> dict:
     destinations: list = list(state.get("destinations") or [])
     candidates: list = []
     ranked: list = []
+    alternative_research: dict[str, dict] = {}
     sources: list = []
     web_context: dict = {}
     trace = list(state.get("tool_trace") or [])
@@ -404,7 +503,11 @@ def execute_plan(state: TourismState) -> dict:
             anchor,
             candidates=candidates,
             forecast_context=fc_ctx if fc_ctx.get("found") else {},
-            user_preferences={"interests": interests or None, "location": loc},
+            user_preferences={
+                "interests": interests or None,
+                "location": loc,
+                "party_type": state.get("party_type"),
+            },
         )
         trace.append("rank_alternatives")
         ranked = [r for r in ranked if r.get("geo_tier") != "same_state" or (r.get("distance_km") or 999) <= 160]
@@ -413,9 +516,26 @@ def execute_plan(state: TourismState) -> dict:
                 anchor,
                 candidates=candidates,
                 forecast_context=fc_ctx if fc_ctx.get("found") else {},
-                user_preferences={"interests": interests or None, "location": loc},
+                user_preferences={
+                    "interests": interests or None,
+                    "location": loc,
+                    "party_type": state.get("party_type"),
+                },
             )
         ranked = ranked[:want_n]
+        ranked, alternative_research, alt_sources, alt_decisions = _research_ranked_alternatives(
+            ranked,
+            start=start,
+            end=end,
+            climate_zone=climate_zone,
+            official_domains=official,
+            search_web=_search,
+        )
+        sources.extend(alt_sources)
+        decisions.extend(alt_decisions)
+        if any(v.get("used_web_fallback") for v in alternative_research.values()):
+            trace.append("web_search_alternatives")
+        trace.append("research_alternatives")
         modes = {r.get("recommendation_mode") for r in ranked}
         decisions.append(
             f"Ranked top {len(ranked)} orbits; modes present: {', '.join(sorted(m for m in modes if m)) or 'none'}."
@@ -445,6 +565,7 @@ def execute_plan(state: TourismState) -> dict:
         "sources": sources,
         "candidate_alternatives": candidates,
         "ranked_alternatives": ranked,
+        "alternative_research": alternative_research,
         "trip_plan": trip_plan,
         "period_pressure": period_pressure,
         "tool_trace": trace,

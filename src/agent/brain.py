@@ -1,127 +1,185 @@
-"""Gemini brain: autonomous travel intelligence agent.
-Consolidated single-pass reasoning for fast response times and zero rate-limit errors."""
+"""Gemini owns tool choice and arguments. Python only executes safe evidence tools."""
 
 from __future__ import annotations
 
 import json
-import os
 import re
 from typing import Any
 
-from src.agent.intent import resolve_intent
-from src.tools_local import (
-    classify_crowd,
-    forecast_crowd,
-    get_destination_profile,
-    get_historical_footfall,
-    search_destinations,
+from src.agent.dispatch import observation_text, run_named_tool
+from src.agent.model_provider import llm_enabled as _llm_enabled, make_chat_model, make_brain_model
+
+ALLOWED_TOOLS = (
+    "clarify_with_user",
+    "set_trip_context",
+    "forecast_crowd",
+    "classify_crowd",
+    "get_historical_footfall",
+    "get_destination_profile",
+    "search_destinations",
+    "web_search",
+    "extract_nearby_places",
+    "assess_period_pressure",
+    "find_similar_destinations",
+    "rank_alternatives",
+    "research_alternative",
+    "optimize_trip",
 )
 from src.tools_period import assess_period_pressure
 from src.tools_recommend import find_similar_destinations, rank_alternatives
 from src.tools_web import web_search
 
-BRAIN_CONVERSATIONAL_PROMPT = """You are a knowledgeable, friendly, and expert travel companion and crowd prediction assistant.
-You talk naturally with the traveler — warm, professional, engaging, and conversational.
-NEVER sound like a robotic template, and NEVER output section titles like "CONCLUSION", "CROWD FORECAST", "LIMITATIONS", or "HOW I REASONED". Just talk naturally using clean markdown formatting (bullet points, bold text).
+# Keep the chat UI responsive and response time low.
+MAX_BRAIN_LOOPS = 8
+MAX_CALLS_PER_STEP = 4
 
-HERE IS THE RESEARCH DATA GATHERED FOR THIS TRIP:
-{research_summary}
+BRAIN_SYSTEM = """You are the autonomous AI travel-crowd advisor brain for SIH 2026 — a friendly, expert guide who NEVER waits for human intervention except for privacy/security concerns.
 
-YOUR TASK:
-1. Warmly acknowledge their trip: Destination, travel window (if given), and traveling style (family, friends, solo).
-2. Crowd Prediction & Reasoning:
-   - State whether the crowd density during their visit duration will be HIGH, MODERATE, or LOW.
-   - Ground your reasoning in the actual features:
-     • Official ASI monument persistence demand and historical trend (if in the dataset)
-     • Weather conditions during that period
-     • Any festivals, events, or local celebrations happening
-     • Gazetted / school holidays
-     • Weekday vs weekend distribution
-   - If the place is NOT in the official ASI dataset, clearly mention that official ticketed history is uncataloged, but give your crowd prediction based on web features, seasonal trends, and weekends/holidays.
-3. Specific Peak Days & Best Calm Hours:
-   - Identify which specific days in their window are likely to see the heaviest rush (e.g., Saturday/Sunday, festival days).
-   - Recommend the best visiting hours (e.g., early morning 6:00 AM – 8:30 AM or late afternoon) when they won't face heavy crowds.
-4. Nearby Alternative & Underrated Destinations:
-   - Recommend 3 to 5 nearby places to explore.
-   - Clearly label which ones are mainstream alternatives and which ones are **underrated / hidden gems**.
-   - Mention approximate distance from the main destination and give a 1–2 sentence reason why each is worth visiting.
-5. Friendly Closing:
-   - End with a welcoming note inviting any questions or itinerary refinements.
+═══════════════════════════════════════════════════════
+CORE PRINCIPLE: You run the full research pipeline autonomously. Every tool-calling decision is yours. Keep it snappy — gather enough facts, then stop and let the answer be composed.
+═══════════════════════════════════════════════════════
 
-Keep your response clean, engaging, informative, and around 200–350 words.
+STEP 1 — SLOT COLLECTION (conversational, one question at a time)
+────────────────────────────────────────────────────────────────
+You need exactly THREE things before researching:
+  (a) Destination  — monument, city, fort, district, or region
+  (b) Travel dates — start and end date (even approximate is fine: "first week of October")
+  (c) Travel party — solo | family | friends
+
+Rules:
+- Call set_trip_context as soon as destination is clear (even if dates/party are still missing).
+- If ANY of the three are genuinely missing from the conversation, call clarify_with_user with ONE warm, specific question covering the most important missing item.
+- NEVER ask for something the user already mentioned. NEVER ask multiple questions at once.
+- Once all three are known, proceed immediately to Step 2 — do NOT ask for confirmation.
+
+STEP 2 — DATASET-FIRST RESEARCH
+────────────────────────────────
+Always check local data before hitting the web. This keeps responses fast and grounded.
+
+  A. If destination is in our dataset:
+     1. search_destinations  → verify the name
+     2. get_destination_profile  → type, state, zone, ratings
+     3. get_historical_footfall  → official ASI annual visitor history
+     4. forecast_crowd  → persistence prediction for next period
+     5. classify_crowd  → LOW / MODERATE / HIGH / VERY HIGH relative level
+
+  B. Fill in dynamic features that the dataset cannot provide:
+     - Weather conditions for the travel window → web_search("{destination} weather {month} {year}")
+     - Upcoming festivals, fairs, events in that period → web_search("{destination} festivals events {month} {year}")
+     - National/regional holidays overlapping the dates → already handled by assess_period_pressure
+     - Official timings or closures → web_search if relevant
+
+  C. If destination is NOT in our dataset at all:
+     - Run web_search to build the place profile, discover type/season/popularity
+     - Then continue with assess_period_pressure and alternatives
+
+  D. Always call assess_period_pressure once web + local data is ready — it synthesises:
+     • Overall crowd density (HIGH / MODERATE / LOW)
+     • Most probable peak day with reason
+     • Peak rush hours to avoid
+     • Best low-crowd visiting hours
+     Never skip this step when dates are known.
+
+STEP 3 — CROWD DENSITY CONCLUSION + DUAL-TIER ALTERNATIVES
+─────────────────────────────────────────────────────────────
+After assess_period_pressure completes:
+  - Determine if crowd is HIGH, MODERATE, or LOW for the travel window.
+  - ALWAYS recommend alternatives regardless of crowd level (users appreciate options).
+  - Call find_similar_destinations → rank_alternatives.
+    rank_alternatives automatically tags each result as:
+      🌟 Popular Alternative  (well-known, lower relative footfall than anchor)
+      💎 Underrated / Hidden Gem  (lesser-known, discovery mode, peaceful ambience)
+  - For the top 1–2 alternatives only, call research_alternative to verify their details.
+  - STOP tool calls after that. Do not loop more than 6 times total.
+
+STEP 4 — WHEN TO STOP
+──────────────────────
+Stop calling tools when you have:
+  ✓ Trip context set (destination, dates, party)
+  ✓ Local data checked (profile + history + forecast + crowd level) OR web fallback done
+  ✓ Web dynamic features fetched (weather, events, holidays)
+  ✓ assess_period_pressure result
+  ✓ At least 2–3 ranked alternatives
+Then return — the answer composer will write the final response from your evidence.
+
+EFFICIENCY RULES
+────────────────
+- MAX 6 tool-call loops total. Make parallel calls (up to 4 per step) when possible.
+- Do NOT call web_search more than 3 times per request.
+- Do NOT call research_alternative for more than 2 candidates.
+- Never invent visitor counts, occupancy %, or hourly headcounts.
+- Never fabricate URLs or event names.
 """
 
-CLARIFICATION_PROMPT = """You are a warm, helpful, and friendly travel advisor.
-The traveler just sent a message, but they haven't named a destination yet, or their request is unclear.
 
-Traveler's message: "{user_request}"
-Conversation history: "{conversation}"
-
-Reply conversationally to welcome them and ask:
-1. Where they are planning to visit (city, monument, or state)
-2. Their approximate travel dates or month
-3. Who they are traveling with (solo, family, or friends)
-
-Keep it short, friendly, and natural.
-"""
+def canonical_tool_name(name: str) -> str:
+    raw = (name or "").strip()
+    if raw.endswith("_tool"):
+        raw = raw[: -len("_tool")]
+    return raw
 
 
-def _llm_enabled() -> bool:
-    if os.environ.get("TOURISM_LLM_BRAIN", "1") != "1":
-        return False
-    return bool((os.getenv("GOOGLE_API_KEY") or "").strip())
+def fallback_tool_plan(state: dict) -> list[str]:
+    """Minimal offline fallback. Live path uses run_llm_tool_loop — Gemini decides everything.
+    This only fires when TOURISM_LLM_BRAIN=0 (test/offline mode).
+    We do the absolute minimum: web search for context + period pressure if dates exist.
+    """
+    tools: list[str] = []
+    if state.get("start_date"):
+        if "web_search" not in (state.get("tool_trace") or []):
+            tools.append("web_search")
+        if "assess_period_pressure" not in (state.get("tool_trace") or []):
+            tools.append("assess_period_pressure")
+    if not tools and state.get("destination"):
+        tools.append("web_search")
+    seen: set[str] = set()
+    return [t for t in tools if t in ALLOWED_TOOLS and not seen.add(t)]  # type: ignore[func-returns-value]
 
 
-def _get_llm(temperature: float = 0.3, max_tokens: int = 1000):
-    from langchain_google_genai import ChatGoogleGenerativeAI
-
-    model = os.getenv("GOOGLE_MODEL", "gemini-3.5-flash")
-    return ChatGoogleGenerativeAI(
-        model=model,
-        google_api_key=os.getenv("GOOGLE_API_KEY"),
-        temperature=temperature,
-        max_output_tokens=max_tokens,
-    )
-
-
-def _extract_text(msg: Any) -> str:
-    content = getattr(msg, "content", msg)
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                if item.get("type") == "text" and item.get("text"):
-                    parts.append(item["text"])
-                elif "text" in item:
-                    parts.append(str(item["text"]))
-        return "\n".join(parts).strip()
-    return str(content or "").strip()
+def _parse_llm_json(raw: str) -> dict | None:
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
-def gather_trip_research(state: dict) -> tuple[dict, dict]:
-    """Execute local dataset lookups and web searches in Python in ~0.5s."""
-    req = state.get("user_request") or state.get("conversation") or ""
-    intent = resolve_intent(req)
-    dest = intent.get("destination") or state.get("destination")
-    start = intent.get("start_date") or state.get("start_date")
-    end = intent.get("end_date") or state.get("end_date")
-    party = intent.get("party_type") or state.get("party_type") or "not specified"
-    interests = intent.get("interests") or state.get("interests") or []
-
-    if not dest:
-        return intent, {"has_destination": False}
-
-    patch: dict[str, Any] = {
-        "destination": dest,
-        "start_date": start,
-        "end_date": end,
-        "party_type": party,
-        "interests": interests,
-        "has_destination": True,
+def _state_snapshot(state: dict) -> dict:
+    return {
+        "user_request": (state.get("user_request") or "")[:4000],
+        "conversation": (state.get("conversation") or "")[:6000],
+        "awaiting_user": bool(state.get("awaiting_user")),
+        "destination": state.get("destination"),
+        "place_names": state.get("place_names"),
+        "dest_state": state.get("dest_state"),
+        "climate_zone": state.get("climate_zone"),
+        "start_date": state.get("start_date"),
+        "end_date": state.get("end_date"),
+        "must_visit": state.get("must_visit"),
+        "party_type": state.get("party_type"),
+        "interests": state.get("interests"),
+        "intent": state.get("intent"),
+        "tool_trace": (state.get("tool_trace") or [])[-24:],
+        "forecasts": {
+            k: {
+                "found": (v or {}).get("found"),
+                "predicted_visitors": (v or {}).get("predicted_visitors"),
+            }
+            for k, v in (state.get("forecasts") or {}).items()
+        },
+        "crowd_levels": {k: (v or {}).get("level") for k, v in (state.get("crowd_levels") or {}).items()},
+        "period_pressure": (state.get("period_pressure") or {}).get("footfall_direction"),
+        "crowd_density": (state.get("period_pressure") or {}).get("crowd_density"),
+        "peak_day": (state.get("period_pressure") or {}).get("peak_day"),
+        "peak_hours": (state.get("period_pressure") or {}).get("peak_hours"),
+        "recommended_hours": (state.get("period_pressure") or {}).get("recommended_hours"),
+        "n_web_hits": len(state.get("web_raw_hits") or []),
+        "n_candidates": len(state.get("candidate_alternatives") or []),
+        "n_ranked": len(state.get("ranked_alternatives") or []),
+        "n_plan_days": len(state.get("trip_plan") or []),
     }
 
     # 1. Dataset lookup (ASI + Kaggle)
@@ -130,24 +188,10 @@ def gather_trip_research(state: dict) -> tuple[dict, dict]:
     has_asi = bool(profile.get("has_asi_history"))
     patch["has_asi_history"] = has_asi
 
-    forecast_info = {}
-    crowd_info = {}
-    if has_asi:
-        asi_name = profile.get("asi_name") or dest
-        hist = get_historical_footfall(asi_name)
-        patch["historical_demand"] = {asi_name: hist}
-        fc = forecast_crowd(asi_name)
-        patch["forecasts"] = {asi_name: fc}
-        forecast_info = fc
-        if fc.get("found"):
-            cl = classify_crowd(asi_name, fc.get("predicted_visitors"))
-            patch["crowd_levels"] = {asi_name: cl}
-            crowd_info = cl
-
-    # 2. Web search for features (weather, festivals, events, holidays)
-    search_q = f"{dest} tourism weather events festivals holidays"
-    web_res = web_search(search_q, max_results=4)
-    patch["web_context"] = web_res
+def run_llm_tool_loop(state: dict) -> dict:
+    """Model selects tools+args; Python executes them into state. Cap enforced here."""
+    try:
+        from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
     # 3. Period pressure assessment (weekends, holidays, season)
     kaggle_meta = profile.get("kaggle") or {}
@@ -170,12 +214,16 @@ def gather_trip_research(state: dict) -> tuple[dict, dict]:
         ranked = []
     patch["ranked_alternatives"] = ranked
 
-    # Build clean research summary for the LLM
-    summary_lines = [
-        f"- Destination: {dest}",
-        f"- Travel Window: {start or 'Dates not specified'} to {end or start or 'Dates not specified'}",
-        f"- Party Type: {party}",
-        f"- Interests: {', '.join(interests) if interests else 'General sightseeing'}",
+    working = dict(state)
+    # Distinguish a Gemini-directed call from offline/direct compatibility
+    # calls without changing the model's authority over the live workflow.
+    working["brain_source"] = "llm"
+    working.setdefault("decisions", [])
+    working.setdefault("tool_trace", [])
+    llm = make_brain_model(max_tokens=1200).bind_tools(ALL_TOOLS)
+    history: list = [
+        SystemMessage(content=BRAIN_SYSTEM),
+        HumanMessage(content=json.dumps(_state_snapshot(working))),
     ]
     if has_asi and forecast_info.get("found"):
         summary_lines.append(
@@ -283,15 +331,45 @@ def run_llm_tool_loop(state: dict) -> dict:
                 return working
         except Exception as exc:
             working["decisions"] = list(working.get("decisions") or []) + [f"Brain LLM error: {exc}"]
-
-    # Fallback if Gemini API is temporarily unavailable
-    from src.agent.compose import compose_final_response
-
-    fallback_resp = compose_final_response(working)
-    working["brain_response"] = fallback_resp
-    working["final_response"] = fallback_resp
-    working["answer_source"] = "offline_template"
-    working["brain_source"] = "fallback"
+            working["brain_source"] = "llm_error"
+            break
+        history.append(msg)
+        calls = list(getattr(msg, "tool_calls", None) or [])
+        if not calls:
+            working["brain_steps"] = int(state.get("brain_steps") or 0) + step + 1
+            working["brain_source"] = "llm"
+            working["brain_ran_tools"] = ran
+            working["tool_trace"] = list(working.get("tool_trace") or []) + ["llm_brain"]
+            return working
+        for call in calls[:MAX_CALLS_PER_STEP]:
+            name = canonical_tool_name(call.get("name") or "")
+            args = call.get("args") or {}
+            if name not in ALLOWED_TOOLS:
+                obs = {"error": f"tool not allowed: {name}"}
+            else:
+                payload, patch = run_named_tool(name, args, working)
+                working.update(patch)
+                ran = True
+                obs = payload
+                if name == "clarify_with_user" or working.get("awaiting_user"):
+                    working["brain_steps"] = int(state.get("brain_steps") or 0) + step + 1
+                    working["brain_source"] = "llm"
+                    working["brain_ran_tools"] = True
+                    working["tool_trace"] = list(working.get("tool_trace") or []) + ["llm_brain"]
+                    return working
+            history.append(
+                ToolMessage(
+                    content=observation_text(name, obs),
+                    tool_call_id=call.get("id") or name,
+                    name=call.get("name") or name,
+                )
+            )
+        history.append(HumanMessage(content="State now: " + json.dumps(_state_snapshot(working))[:6000]))
+    working["brain_steps"] = int(state.get("brain_steps") or 0) + MAX_BRAIN_LOOPS
+    working["brain_source"] = "llm_cap"
+    working["brain_ran_tools"] = ran
+    working["tool_trace"] = list(working.get("tool_trace") or []) + ["llm_brain"]
+    working["decisions"] = list(working.get("decisions") or []) + ["Stopped at brain tool-call cap."]
     return working
 
 

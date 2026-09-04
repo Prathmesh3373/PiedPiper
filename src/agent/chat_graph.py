@@ -78,38 +78,102 @@ def conversation_to_user_request(messages: list) -> str:
     return f"{transcript}\n\nLatest traveler message:\n{latest}"
 
 
-def format_chat_answer(raw: str) -> str:
-    """Chat bubble. Returns conversational response directly."""
-    text = (raw or "").strip()
-    return text if text else "(no response from tourism agent)"
+_CHAT_SECTION_ORDER = (
+    "CONCLUSION",
+    "CROWD FORECAST",
+    "TRAVEL WINDOW",
+    "CURRENT CONTEXT",
+    "ALTERNATIVES",
+    "TRIP PLAN",
+    "LIMITATIONS",
+    "HOW I REASONED (decision log)",
+)
+
+_CHAT_TITLES = {
+    "CONCLUSION": "According to our analysis",
+    "CROWD FORECAST": "Crowd forecast",
+    "TRAVEL WINDOW": "Travel window",
+    "CURRENT CONTEXT": "Current context",
+    "ALTERNATIVES": "Nearby / underrated places",
+    "TRIP PLAN": "Schedule",
+    "LIMITATIONS": "Limitations",
+    "HOW I REASONED (decision log)": "How I reasoned",
+}
 
 
-def tool_event_messages(events: list[dict]) -> list[BaseMessage]:
-    """Replay the inner brain's actual tool calls in Agent Chat.
+def _split_agent_sections(raw: str) -> dict[str, str]:
+    found: list[tuple[int, str]] = []
+    for name in _CHAT_TITLES:
+        idx = raw.find(name)
+        if idx >= 0:
+            found.append((idx, name))
+    found.sort()
+    sections: dict[str, str] = {}
+    for i, (start, name) in enumerate(found):
+        end = found[i + 1][0] if i + 1 < len(found) else len(raw)
+        sections[name] = raw[start + len(name) : end].strip()
+    return sections
 
-    The adapter does not choose or run tools itself. It only makes the
-    brain-selected calls and the facts returned by Python visible to the UI.
+
+def _trim_alt_debug(body: str) -> str:
+    """Drop planner boolean dumps; keep names, modes, demand, and why."""
+    keep: list[str] = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("relevance=") or stripped.startswith("geo_tier="):
+            continue
+        keep.append(line)
+    return "\n".join(keep).strip()
+
+
+def _looks_like_template(text: str) -> bool:
+    """Detect the old deterministic ALL-CAPS template (starts with a section header
+    on its own line, e.g. 'CONCLUSION\\n' or 'CROWD FORECAST\\n').
+
+    Gemini's free-form Markdown answers start with **, #, or prose — they never
+    start a bare line with one of these exact labels followed by a newline.
+    We check for the header *at the start of a line* followed by a newline or
+    end-of-string, so a word like CONCLUSION inside Gemini prose won't trigger it.
     """
-    messages: list[BaseMessage] = []
-    for index, event in enumerate(events or [], start=1):
-        name = str(event.get("name") or "unknown_tool")
-        call_id = f"tourism-tool-{index}"
-        args = event.get("args") if isinstance(event.get("args"), dict) else {}
-        observation = event.get("observation")
-        messages.append(
-            AIMessage(
-                content="",
-                tool_calls=[{"name": name, "args": args, "id": call_id}],
-            )
-        )
-        messages.append(
-            ToolMessage(
-                name=name,
-                tool_call_id=call_id,
-                content=json.dumps(observation, default=str),
-            )
-        )
-    return messages
+    import re
+    for name in _CHAT_TITLES:
+        # Must appear at the very start of a line (^) as the complete line content
+        if re.search(r"(^|\n)" + re.escape(name) + r"\s*\n", text):
+            return True
+    return False
+
+
+def format_chat_answer(raw: str) -> str:
+    """Chat bubble formatter.
+
+    - Gemini free-form Markdown answers (the normal live path) are returned as-is.
+      They already contain well-structured headers, bullets, and emoji — no re-wrapping needed.
+    - Old deterministic template responses (ALL-CAPS section names) are split and
+      re-titled for cleaner rendering in the LangGraph chat UI.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return "(no response from tourism agent)"
+
+    # Live Gemini path: pass through unchanged.
+    if not _looks_like_template(text):
+        return text
+
+    # Deterministic template path: split into titled sections.
+    sections = _split_agent_sections(text)
+    if not sections:
+        return text
+
+    parts: list[str] = []
+    for key in _CHAT_SECTION_ORDER:
+        body = sections.get(key)
+        if body is None:
+            continue
+        if key == "ALTERNATIVES":
+            body = _trim_alt_debug(body)
+        title = _CHAT_TITLES[key]
+        parts.append(f"## {title}\n\n{body}")
+    return "\n\n".join(parts).strip() or text
 
 
 def tourism_turn(state: MessagesState) -> dict:

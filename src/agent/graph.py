@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -41,7 +42,7 @@ def coerce_user_request(state: dict) -> str:
 
 
 def parse_intent(state: TourismState) -> dict:
-    """Prepare empty research buckets; the live brain interprets the trip."""
+    """Prepare neutral state. Gemini interprets live conversations; parser is offline-only."""
     request = coerce_user_request(state)
     buckets = {
         "tool_trace": ["parse_intent"],
@@ -62,26 +63,22 @@ def parse_intent(state: TourismState) -> dict:
         "user_request": request,
         "conversation": state.get("conversation") or request,
     }
-    if _llm_enabled():
-        return {
-            **buckets,
-            "destination": None,
-            "start_date": None,
-            "end_date": None,
-            "interests": [],
-            "must_visit": [],
-            "place_names": [],
-            "intent": {},
-            "awaiting_user": False,
-        }
-    parsed = resolve_intent(request)
+    # Preserve plainly stated trip facts as transcript context. Gemini still
+    # owns every live question, tool choice, and conclusion.
+    parsed = resolve_intent(request, use_llm=False)
     return {**buckets, **parsed}
 
 
 def brain_intent_node(state: TourismState) -> dict:
-    """OpenAI chooses every tool and argument. Offline: flags only, then Python execute_plan."""
+    """Gemini chooses every live action; offline mode retains deterministic tests."""
     if _llm_enabled():
         return run_llm_tool_loop(state)
+    if os.environ.get("TOURISM_LLM_BRAIN", "1") == "1":
+        return {
+            "brain_source": "gemini_unavailable",
+            "brain_ran_tools": True,
+            "tool_trace": list(state.get("tool_trace") or []) + ["gemini_configuration_required"],
+        }
     choice = decide_next_tools(state)
     intent = dict(state.get("intent") or {})
     tools = set(choice.get("tools") or [])
@@ -107,7 +104,7 @@ def brain_intent_node(state: TourismState) -> dict:
 
 
 def execute_plan_node(state: TourismState) -> dict:
-    if (state.get("brain_source") != "fallback" and _llm_enabled()) or state.get("brain_ran_tools"):
+    if state.get("brain_ran_tools") and state.get("brain_source") != "llm_error":
         return {}
     return execute_plan(state)
 
@@ -115,9 +112,9 @@ def execute_plan_node(state: TourismState) -> dict:
 def route_after_brain(state: TourismState) -> str:
     if state.get("awaiting_user"):
         return "compose_response"
-    if state.get("brain_source") == "fallback":
+    if state.get("brain_source") == "llm_error":
         return "execute_plan"
-    if _llm_enabled() or state.get("brain_ran_tools"):
+    if state.get("brain_ran_tools"):
         return "compose_response"
     return "execute_plan"
 

@@ -14,6 +14,7 @@ from src.geo import (
     distance_score,
     geo_tier,
     geography_verified,
+    get_coordinates,
     is_practical_orbit,
     pair_distance_km,
 )
@@ -46,6 +47,28 @@ DISCOVERY_WEIGHTS = {
 DEFAULT_WEIGHTS = CROWD_BACKED_WEIGHTS
 
 
+def _party_fit(candidate: dict, party_type: str | None) -> float | None:
+    """Return a transparent logistics fit, never a claim that a place is family-safe."""
+    party = (party_type or "").strip().lower()
+    if party not in {"family", "friends", "solo"}:
+        return None
+    rating = candidate.get("google_rating")
+    try:
+        rating_score = float(np.clip((float(rating) - 3.0) / 2.0, 0.0, 1.0))
+    except (TypeError, ValueError):
+        rating_score = 0.5
+    airport_score = 1.0 if str(candidate.get("airport_within_50km") or "").lower() == "yes" else 0.45
+    try:
+        ticket_score = float(np.clip(1.0 - float(candidate.get("ticket_price") or 0.0) / 1_000.0, 0.0, 1.0))
+    except (TypeError, ValueError):
+        ticket_score = 0.5
+    if party == "family":
+        return round(0.45 * airport_score + 0.35 * rating_score + 0.20 * ticket_score, 3)
+    if party == "solo":
+        return round(0.55 * airport_score + 0.45 * rating_score, 3)
+    return round(0.60 * rating_score + 0.40 * ticket_score, 3)
+
+
 def _dedupe_candidates(items: list[dict]) -> list[dict]:
     seen = set()
     out = []
@@ -73,6 +96,23 @@ def find_similar_destinations(
     state = (kaggle.get("state") or location or "").lower()
     origin_city = (kaggle.get("city") or location or destination or "").strip()
     origin_name = profile.get("asi_name") or profile.get("kaggle_name") or destination
+
+    if not state:
+        dest_l = (destination or "").lower()
+        if any(c in dest_l for c in ("kolhapur", "pune", "mumbai", "satara", "sangli", "solapur", "aurangabad", "ratnagiri", "sindhudurg", "panhala")):
+            state = "maharashtra"
+        elif any(c in dest_l for c in ("agra", "lucknow", "varanasi", "mathura", "fatehpur", "sarnath")):
+            state = "uttar pradesh"
+        elif any(c in dest_l for c in ("hampi", "bengaluru", "bangalore", "mysore", "badami", "belgaum", "belagavi")):
+            state = "karnataka"
+        elif any(c in dest_l for c in ("delhi", "new delhi")):
+            state = "delhi"
+        else:
+            hits = search_destinations(destination, limit=3)
+            for h in hits:
+                if h.get("state"):
+                    state = str(h["state"]).lower()
+                    break
 
     cat = kaggle_catalog()
     origin_l = origin_name.lower()
@@ -106,7 +146,8 @@ def find_similar_destinations(
         type_local = (same_type or interest_hit or name_sim >= 0.72) and local_ok
         if not local_ok and not include_wider:
             continue
-        if not (type_local or local_ok and (same_type or interest_hit or same_state)):
+        is_nearby_geo = tier in {"locality_city", "locality_district", "nearby_region"} or (dist is not None and dist <= 160.0)
+        if not (type_local or (local_ok and (same_type or interest_hit or same_state or is_nearby_geo))):
             continue
         if max_distance_km is not None and dist is not None and dist > max_distance_km and not include_wider:
             continue
@@ -119,6 +160,7 @@ def find_similar_destinations(
                 "zone": row["zone"],
                 "season": row["season"],
                 "google_rating": row["google_rating"],
+                "ticket_price": row["ticket_price"],
                 "airport_within_50km": row["airport_within_50km"],
                 "distance_km": dist,
                 "geo_tier": tier,
@@ -170,6 +212,7 @@ def find_similar_destinations(
                     "zone": "",
                     "season": "",
                     "google_rating": None,
+                    "ticket_price": None,
                     "airport_within_50km": "",
                     "distance_km": dist,
                     "geo_tier": tier,
@@ -182,6 +225,50 @@ def find_similar_destinations(
                         "same_zone": False,
                         "interest_hit": False,
                         "same_asi_circle": True,
+                    },
+                }
+            )
+
+    # Also search direct attractions matching destination
+    city_hits = search_destinations(destination, limit=10)
+    for hit in city_hits:
+        if hit["name"].lower() == origin_l:
+            continue
+        dist = pair_distance_km(origin_city or destination, hit["name"], None)
+        tier = geo_tier(
+            origin_name=destination,
+            origin_city=origin_city,
+            origin_state=state,
+            cand_city="",
+            cand_state=hit.get("state") or state,
+            cand_name=hit["name"],
+            same_asi_circle=False,
+            distance_km=dist,
+        )
+        geo_ok = geography_verified(tier, dist)
+        if is_practical_orbit(tier, dist, relax=include_wider):
+            asi_candidates.append(
+                {
+                    "name": hit["name"],
+                    "place_type": hit.get("place_type") or "Attraction",
+                    "state": hit.get("state") or state,
+                    "city": origin_city or destination,
+                    "zone": hit.get("zone") or "",
+                    "season": "",
+                    "google_rating": 4.5,
+                    "ticket_price": 0,
+                    "airport_within_50km": "yes",
+                    "distance_km": dist,
+                    "geo_tier": tier,
+                    "geography_verified": geo_ok,
+                    "source": hit.get("source") or "kaggle",
+                    "role": "orbit",
+                    "relevance": {
+                        "same_type": True,
+                        "same_state": True,
+                        "same_zone": True,
+                        "interest_hit": True,
+                        "same_asi_circle": False,
                     },
                 }
             )
@@ -267,9 +354,9 @@ def rank_alternatives(
         if rel.get("interest_hit"):
             similarity += 0.20
         if tier in {"locality_city", "locality_district"}:
-            similarity += 0.20
-        elif tier == "nearby_region":
-            similarity += 0.10
+            similarity += 0.35
+        elif tier == "nearby_region" or (dist is not None and dist <= 160.0):
+            similarity += 0.25
         similarity = float(min(similarity, 1.0))
         relevant = similarity >= 0.2 or bool(rel.get("interest_hit") or rel.get("same_type"))
 
@@ -280,6 +367,8 @@ def rank_alternatives(
 
         airport = str(cand.get("airport_within_50km") or "")
         accessibility = 0.8 if airport.lower() == "yes" else 0.45
+        party_type = prefs.get("party_type")
+        party_fit = _party_fit(cand, party_type)
 
         cand_visitors = None
         try:
@@ -331,6 +420,11 @@ def rank_alternatives(
                 - w["distance_penalty"] * distance_penalty
             )
 
+        # A small, bounded tie-breaker: party type adjusts logistics preference,
+        # but never overrides crowd evidence, geography, or relevance.
+        if party_fit is not None:
+            score += 0.08 * (party_fit - 0.5)
+
         why = []
         why.append(f"recommendation_mode={mode}")
         why.append(f"geo_tier={tier}")
@@ -342,6 +436,11 @@ def rank_alternatives(
             why.append("Same ASI circle (heritage similarity only; not treated as nearby)")
         if rel.get("same_type"):
             why.append(f"Similar type ({cand.get('place_type')})")
+        if party_fit is not None:
+            why.append(
+                f"Travel-party logistics considered for {party_type} "
+                "(rating, access, and ticket-price metadata; not a safety claim)"
+            )
         if cand_visitors is not None and mode == "crowd_backed":
             why.append(
                 f"Lower predicted annual demand ({cand_visitors:,.0f} vs {anchor_visitors:,.0f})"
@@ -352,6 +451,71 @@ def rank_alternatives(
             why.append("Discovery: no ASI annual series; no crowd number invented")
         why.append("Heuristic ranking, not occupancy")
 
+        # Resolve coordinates for map rendering
+        coords = get_coordinates(name) or get_coordinates(city) or get_coordinates(cand.get("state"))
+        lat = coords[0] if coords else None
+        lng = coords[1] if coords else None
+
+        # Classify popular vs underrated/hidden gem.
+        #
+        # Popular = widely known, high footfall, or a major ASI monument with
+        #   confirmed crowd-backed data above 750k.
+        # Underrated/Hidden gem = genuinely lesser-known place: low ASI footfall,
+        #   discovery-mode (no official data), or a small local fort/temple/lake.
+        #
+        # Discovery mode alone is NOT enough to call something a hidden gem —
+        # a place like Agra Fort or Mysore Palace has no "discovery" issue even
+        # if it happens to lack an ASI series in our dataset.  We use the
+        # Kaggle google_rating and name-based prominence signals to distinguish.
+        is_popular = False
+        is_underrated = False
+
+        if cand_visitors is not None and cand_visitors >= 750_000:
+            # Confirmed high footfall → popular
+            is_popular = True
+        elif mode == "crowd_backed" and cand_visitors is not None and cand_visitors >= 300_000:
+            # Reasonable footfall, data-backed → popular
+            is_popular = True
+        else:
+            # No ASI data or low footfall — use name / rating signals
+            rating = None
+            try:
+                rating = float(cand.get("google_rating") or 0)
+            except (TypeError, ValueError):
+                rating = None
+
+            # Well-known monuments / forts / palaces are popular even without data
+            name_l_check = name.lower()
+            prominent_keywords = (
+                "fort", "palace", "mahal", "temple", "mandir", "cathedral",
+                "mosque", "church", "museum", "zoo", "national park",
+            )
+            is_prominent_type = any(k in name_l_check for k in prominent_keywords)
+
+            if is_prominent_type and (rating is None or rating >= 4.0):
+                # Well-known place type with good rating → popular
+                is_popular = True
+            elif rel.get("same_asi_circle") and mode == "crowd_backed":
+                # ASI-circle match with data → treat as popular
+                is_popular = True
+
+        if not is_popular:
+            is_underrated = True
+
+        category = "underrated" if is_underrated else "popular"
+
+        # Timing recommendations
+        name_l = name.lower()
+        if any(k in name_l for k in ("temple", "mandir", "shrine", "darshan")):
+            cand_peak_hours = "8:00 AM – 12:00 PM & 6:00 PM – 8:00 PM"
+            cand_rec_hours = "6:00 AM – 7:30 AM or 2:00 PM – 4:00 PM"
+        elif any(k in name_l for k in ("fort", "gad", "gadh", "point", "lake", "falls")):
+            cand_peak_hours = "3:30 PM – 6:30 PM (Sunset rush)"
+            cand_rec_hours = "7:00 AM – 10:00 AM (Serene views)"
+        else:
+            cand_peak_hours = "11:00 AM – 3:30 PM"
+            cand_rec_hours = "6:30 AM – 9:00 AM or 4:00 PM – 5:30 PM"
+
         ranked.append(
             {
                 "name": name,
@@ -360,6 +524,8 @@ def rank_alternatives(
                 "recommendation_kind": (
                     "crowd-backed alternative" if mode == "crowd_backed" else "discovery recommendation"
                 ),
+                "category": category,
+                "is_underrated": is_underrated,
                 "relevant": relevant,
                 "practical": practical,
                 "crowd_data_available": crowd_data_available,
@@ -370,6 +536,10 @@ def rank_alternatives(
                 "distance_score": round(d_score, 3),
                 "city": city,
                 "state": cand.get("state"),
+                "lat": lat,
+                "lng": lng,
+                "peak_hours": cand_peak_hours,
+                "recommended_hours": cand_rec_hours,
                 "source": cand.get("source"),
                 "url": cand.get("url"),
                 "evidence_tier": cand.get("evidence_tier"),
@@ -380,6 +550,7 @@ def rank_alternatives(
                     "discovery_bonus": round(discovery, 3),
                     "crowd_pressure": round(crowd_pressure, 3) if mode == "crowd_backed" else None,
                     "distance_penalty": distance_penalty,
+                    "party_fit": party_fit,
                 },
                 "predicted_visitors": cand_visitors if mode == "crowd_backed" else None,
                 "why": why,

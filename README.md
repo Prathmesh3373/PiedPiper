@@ -2,7 +2,7 @@
 
 SIH 2026 decision-support agent for **Indian heritage tourism**.
 
-A traveler talks in chat. The **OpenAI brain** interprets the trip, asks for missing details (place, dates, family / friends / solo), then **chooses tools**. Python only **runs** those tools against ASI + Kaggle data, official web search, geography filters, and ranking. The spoken reply is written by the model from **tool facts** — it does not invent visitor counts.
+A traveler talks in chat. The **Gemini brain** interprets the full conversation, asks only for details it still needs (place, dates, family / friends / solo), then **chooses tools**. Python only **runs** Gemini-selected tools against ASI + Kaggle data, official web search, geography filters, and ranking. The spoken reply is written by Gemini from **tool facts** — it does not invent visitor counts.
 
 **Live crowd number (when an ASI monument series exists):** last observed financial-year total (**persistence**). Offline experiments (Ridge / RF / GB / a small MLP) lost to this baseline on chronological ASI splits, so they are **not** in the live path.
 
@@ -36,7 +36,7 @@ flowchart LR
   CLI --> G[Tourism graph]
   S --> CG[chat_graph adapter]
   CG --> G
-  subgraph Brain["OpenAI brain"]
+  subgraph Brain["Gemini brain"]
     ASK[Ask missing slots]
     TOOLS[Choose tools and arguments]
     WRITE[Write conversational reply]
@@ -66,14 +66,14 @@ Chat UI talks to graph id **`tourism`** (`src/agent/chat_graph.py`). Each turn c
 flowchart TD
   START([START]) --> PI[parse_intent]
   PI --> BR[llm_brain]
-  BR -->|OpenAI API + tools| DISP[dispatch: run named tools]
+  BR -->|Gemini API + tools| DISP[dispatch: run named tools]
   BR -->|offline / no API key| EP[execute_plan fallback]
   BR --> COMP[compose_answer]
   EP --> COMP
   COMP --> END([END])
 ```
 
-**Brain decides:** interpret → catalog research (ASI/Kaggle) → web for gaps → whether research is enough → window pressure vs annual baseline → nearby recommendations if the **full research bundle** looks busy (not only annual HIGH) → conversational answer or a follow-up question.
+**Gemini decides:** interpret → catalog research (ASI/Kaggle) → web for gaps → whether research is enough → window pressure vs annual baseline → nearby recommendations if the **full research bundle** looks busy (not only annual HIGH) → the same catalog/web/window research for each candidate it recommends → conversational answer or a follow-up question. If Gemini is not configured, the live application returns a configuration message rather than silently substituting another model or a scripted conversation.
 
 ### Crowd model (validated)
 
@@ -129,18 +129,15 @@ PiedPiper/
 
 ## Setup
 
-Python **3.11+**. From the repo root:
+Python **3.11+**. This project is configured to run from the global Python installation; do not activate a project virtual environment. From the repo root:
 
 ```bash
-python -m venv .venv
-# Windows: .venv\Scripts\activate
-# macOS/Linux: source .venv/bin/activate
 python -m pip install -r requirements.txt
-copy .env.example .env   # Windows
+Copy-Item .env.example .env   # Windows PowerShell
 # cp .env.example .env   # macOS/Linux
 ```
 
-Put `OPENAI_API_KEY` in `.env`. Optional: `TAVILY_API_KEY` for web search (otherwise Wikipedia OpenSearch).
+Put `GEMINI_API_KEY` in `.env` and keep `TOURISM_LLM_PROVIDER=gemini`. Optional: `TAVILY_API_KEY` enables richer web search (otherwise Wikipedia OpenSearch).
 
 **Never commit `.env`.**
 

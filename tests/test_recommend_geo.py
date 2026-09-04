@@ -208,6 +208,62 @@ class RankModeTests(unittest.TestCase):
         )
         self.assertEqual(ranked, [])
 
+    def test_party_type_changes_only_a_small_logistics_tiebreaker(self):
+        candidate = {
+            "name": "Kaas Plateau",
+            "city": "Satara",
+            "state": "Maharashtra",
+            "place_type": "Valley",
+            "geo_tier": "nearby_region",
+            "distance_km": 110,
+            "relevance": {"interest_hit": True, "same_type": False, "same_asi_circle": False},
+            "airport_within_50km": "No",
+            "google_rating": 4.6,
+            "ticket_price": 50,
+            "source": "kaggle",
+        }
+        base = rank_alternatives("Kolhapur", candidates=[candidate], user_preferences={"location": "Kolhapur"})
+        family = rank_alternatives(
+            "Kolhapur", candidates=[candidate],
+            user_preferences={"location": "Kolhapur", "party_type": "family"},
+        )
+        self.assertIsNone(base[0]["components"]["party_fit"])
+        self.assertIsNotNone(family[0]["components"]["party_fit"])
+        self.assertIn("Travel-party logistics", " ".join(family[0]["why"]))
+
+    def test_llm_rank_tool_researches_each_displayed_alternative(self):
+        from src.agent.dispatch import run_named_tool
+
+        candidate = {
+            "name": "Kaas Plateau",
+            "city": "Satara",
+            "state": "Maharashtra",
+            "place_type": "Valley",
+            "geo_tier": "nearby_region",
+            "distance_km": 110,
+            "relevance": {"interest_hit": True, "same_type": False, "same_asi_circle": False},
+            "airport_within_50km": "No",
+            "source": "kaggle",
+        }
+        with patch("src.agent.dispatch.web_search", return_value={"results": [], "provider": "test", "warnings": []}) as search:
+            _, out = run_named_tool(
+                "rank_alternatives",
+                {"anchor": "Kolhapur"},
+                {
+                    "destination": "Kolhapur",
+                    "party_type": "family",
+                    "start_date": "2026-09-01",
+                    "end_date": "2026-09-03",
+                    "candidate_alternatives": [candidate],
+                    "intent": {"requested_n": 1},
+                },
+            )
+        self.assertIn("Kaas Plateau", out["alternative_research"])
+        evidence = out["alternative_research"]["Kaas Plateau"]
+        self.assertTrue(evidence["used_web_fallback"])
+        self.assertIn("period_pressure", evidence)
+        search.assert_called_once()
+
 
 class WebEvidenceTests(unittest.TestCase):
     def test_junk_pdf(self):

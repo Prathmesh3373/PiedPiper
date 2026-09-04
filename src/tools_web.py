@@ -12,6 +12,14 @@ from src.geo import CITY_COORDS, nearby_set
 
 USER_AGENT = "tourism-crowd-dss/0.1 (SIH prototype; educational)"
 
+
+def _web_timeout_seconds() -> float:
+    """Short, configurable timeout so a stalled search never stalls chat indefinitely."""
+    try:
+        return max(3.0, float(os.getenv("TOURISM_WEB_TIMEOUT_SECONDS", "8")))
+    except ValueError:
+        return 8.0
+
 OFFICIAL_HOST_MARKERS = (
     "asi.nic.in",
     "tourism.gov.in",
@@ -205,8 +213,13 @@ def structure_web_context(
             if topic in buckets:
                 buckets[topic].append(h)
                 placed = True
-        if not placed:
-            discovery.append(h)
+    # If weather was not extracted from web search snippets, query OpenWeather if available
+    if not buckets["weather"] and destination:
+        ow_hit = fetch_openweather(destination)
+        if ow_hit:
+            buckets["weather"].append(ow_hit)
+            kept.append(ow_hit)
+
     return {
         "provider": provider,
         "retrieved_on": date.today().isoformat(),
@@ -277,9 +290,15 @@ def llm_nearby_attractions(
     region_state: str = "",
     name_tokens: list[str] | None = None,
 ) -> list[dict]:
-    """Lightweight pass-through: web_discovery_candidates extracts attractions directly
-    without making a redundant nested LLM call."""
-    return []
+    """LLM reads search snippets and lists places actually near dest. No crowd numbers."""
+    from src.agent.model_provider import llm_enabled, make_chat_model
+
+    # The deterministic extractor already handles this path. A second LLM call
+    # is opt-in because it makes an interactive answer noticeably slower.
+    if os.getenv("TOURISM_LLM_SNIPPET_EXTRACTION", "0") != "1":
+        return []
+    if not llm_enabled():
+        return []
     dest_l = (dest or "").lower()
     tokens = [t.lower() for t in (name_tokens or []) if t] or ([dest_l] if dest_l else [])
     usable = []
@@ -306,7 +325,6 @@ def llm_nearby_attractions(
         import re
 
         from langchain_core.messages import HumanMessage, SystemMessage
-        from langchain_google_genai import ChatGoogleGenerativeAI
 
         prompt = (
             f"Destination: {dest} ({region_state or 'India'}).\n"
@@ -317,12 +335,7 @@ def llm_nearby_attractions(
             'JSON: {"places": [{"name": "...", "kind": "Temple"}]}\n'
             f"Hits: {json.dumps(usable)[:5000]}"
         )
-        llm = ChatGoogleGenerativeAI(
-            model=os.getenv("GOOGLE_MODEL", "gemini-3.6-flash"),
-            google_api_key=os.getenv("GOOGLE_API_KEY"),
-            temperature=0,
-            max_output_tokens=400,
-        )
+        llm = make_chat_model(temperature=0, max_tokens=250)
         msg = llm.invoke(
             [
                 SystemMessage(content="Extract nearby attractions JSON only. No visitor counts."),
@@ -546,6 +559,36 @@ def _dedupe_web(items: list[dict]) -> list[dict]:
     return out
 
 
+def fetch_openweather(location: str) -> dict | None:
+    """Fetch live weather metrics from OpenWeatherMap API."""
+    api_key = os.environ.get("OPENWEATHER_API_KEY", "").strip()
+    if not api_key or not location:
+        return None
+    try:
+        clean = location.split(",")[0].strip()
+        url = f"https://api.openweathermap.org/data/2.5/weather?q={urllib.parse.quote(clean)},IN&appid={api_key}&units=metric"
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=4.0) as resp:
+            data = json.loads(resp.read().decode())
+        main = data.get("main", {})
+        weather_list = data.get("weather", [{}])
+        cond = weather_list[0].get("description", "clear") if weather_list else "clear"
+        temp = main.get("temp")
+        feels_like = main.get("feels_like")
+        humidity = main.get("humidity")
+        return {
+            "title": f"Live Weather for {clean}",
+            "snippet": f"Conditions: {cond.capitalize()}, temperature {temp}°C (feels like {feels_like}°C), humidity {humidity}%.",
+            "url": "https://openweathermap.org",
+            "source": "openweathermap.org",
+            "evidence_tier": "official",
+            "topics": ["weather"],
+            "junk": False,
+        }
+    except Exception:
+        return None
+
+
 def web_search(query: str, domains: list[str] | None = None, max_results: int = 5) -> dict:
     """Search the public web. Returns structured hits or an explicit failure.
 
@@ -568,9 +611,11 @@ def web_search(query: str, domains: list[str] | None = None, max_results: int = 
     wiki = _wikipedia_search(query.strip(), max_results)
     results = annotate_results(wiki["results"])
     if domains:
-        results = [
+        filtered = [
             r for r in results if any(d.lower() in (r.get("url") or "").lower() for d in domains)
         ]
+        if filtered:
+            results = filtered
     return {
         "query": query,
         "provider": "wikipedia_opensearch" if results else "none",
@@ -603,7 +648,7 @@ def _tavily_search(query: str, key: str, max_results: int) -> dict:
         headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with urllib.request.urlopen(req, timeout=_web_timeout_seconds()) as resp:
         data = json.loads(resp.read().decode())
     results = []
     for item in data.get("results", [])[:max_results]:
@@ -639,7 +684,7 @@ def _wikipedia_search(query: str, max_results: int) -> dict:
     )
     url = f"https://en.wikipedia.org/w/api.php?{params}"
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with urllib.request.urlopen(req, timeout=_web_timeout_seconds()) as resp:
         payload = json.loads(resp.read().decode())
     titles = payload[1] if len(payload) > 1 else []
     descs = payload[2] if len(payload) > 2 else []

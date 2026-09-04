@@ -264,29 +264,13 @@ def _destination(raw: str, lower: str) -> str | None:
         token = new_to.group(1).strip()
         if token and token.split()[0] not in skip_dest:
             return " ".join(w.capitalize() for w in token.split())
-    visiting = re.search(
-        r"\b(?:i(?:'m| am)?\s+)?(?:plan(?:ning)?\s+(?:to\s+visit|a\s+trip\s+to|to\s+travel\s+to|to\s+go\s+to|to\s+head\s+to|trip\s+to)|visit(?:ing)?|travel(?:ing)?\s+to|go(?:ing)?\s+to|head(?:ing)?\s+to)\s+"
-        r"(?:to\s+)?([a-z][a-z\s]{1,50}?)(?:\s+(?:with|from|on|during|in|next|for)\b|[,.?!]|$)",
+    trip_to = re.search(
+        r"\b(?:go(?:ing)?|travel(?:ling)?|visit(?:ing)?|trip)\s+(?:to\s+)?"
+        r"([a-z][a-z\s]{1,40}?)(?=\s+(?:with|from|on|during|between|for)\b|[,.?]|$)",
         lower,
     )
-    if visiting:
-        token = visiting.group(1).strip()
-        if token and token.split()[0] not in skip_dest:
-            return " ".join(w.capitalize() for w in token.split() if w not in skip)
-    crowd_q = re.search(
-        r"\b(?:how\s+(?:crowded|busy)\s+is|will|is)\s+([a-z][a-z\s]{1,40}?)\s+(?:be\s+crowded|be\s+busy|expected|crowded|busy|\?|$)",
-        lower,
-    )
-    if crowd_q:
-        token = crowd_q.group(1).strip()
-        if token and token.split()[0] not in skip_dest:
-            return " ".join(w.capitalize() for w in token.split() if w not in skip)
-    what_about = re.search(
-        r"\b(?:what|how)\s+about\s+([a-z][a-z\s]{1,40}?)(?:\s+next|\s+with|\s+in|\?|$)",
-        lower,
-    )
-    if what_about:
-        token = what_about.group(1).strip()
+    if trip_to:
+        token = trip_to.group(1).strip()
         if token and token.split()[0] not in skip_dest:
             return " ".join(w.capitalize() for w in token.split() if w not in skip)
     fort = re.search(r"\b([a-z][a-z]+(?:gad|gadh|pur)?)\s+fort\b", lower)
@@ -327,6 +311,13 @@ def extract_intent(text: str) -> dict:
     dest = _destination(raw, lower)
     must = [n for n in ["Mahalakshmi", "Jyotiba", "Panhala"] if n.lower() in lower]
     interests = [w for w in ["temples", "forts", "nature", "heritage", "spiritual", "beaches"] if w in lower]
+    party_type = None
+    if re.search(r"\b(solo|alone|by myself|on my own)\b", lower):
+        party_type = "solo"
+    elif re.search(r"\b(with (my )?family|family trip|with kids|with children)\b", lower):
+        party_type = "family"
+    elif re.search(r"\b(with (my )?friends|friends trip|with friends)\b", lower):
+        party_type = "friends"
 
     party = None
     if any(w in lower for w in ("family", "parents", "kids", "children")):
@@ -364,6 +355,7 @@ def extract_intent(text: str) -> dict:
         "end_date": end,
         "interests": interests,
         "must_visit": must,
+        "party_type": party_type,
         "intent": flags,
         "is_multi_day": bool(start and end),
         "wants_hourly": wants_hourly,
@@ -379,5 +371,50 @@ def _slot_bool(slots: dict, key: str) -> bool:
 
 
 def resolve_intent(text: str, use_llm: bool = True) -> dict:
-    """Keyword flags plus place/party slots."""
-    return extract_intent(text)
+    """Keyword flags plus optional LLM place/interest slots. Tools still emit numbers."""
+    from src.agent.slots import llm_extract_slots
+
+    base = extract_intent(text)
+    dest = base.get("destination")
+    if dest and ("instead" in dest.lower() or dest.lower().startswith("should ")):
+        dest = None
+        base["destination"] = None
+    slots = llm_extract_slots(text) if use_llm else None
+    if not slots:
+        return base
+    llm_dest = slots.get("destination")
+    if isinstance(llm_dest, str):
+        llm_dest = llm_dest.strip() or None
+    else:
+        llm_dest = None
+    if llm_dest and (not dest or "instead" in str(dest).lower()):
+        base["destination"] = llm_dest
+    for key in ("start_date", "end_date"):
+        if slots.get(key) and not base.get(key):
+            base[key] = slots[key]
+    if slots.get("interests"):
+        extra = [str(x).lower() for x in slots["interests"] if x]
+        base["interests"] = list(dict.fromkeys(list(base.get("interests") or []) + extra))
+    if slots.get("must_visit"):
+        extra = [str(x) for x in slots["must_visit"] if x]
+        base["must_visit"] = list(dict.fromkeys(list(base.get("must_visit") or []) + extra))
+    party = slots.get("party_type")
+    if isinstance(party, str) and party.strip().lower() in {"family", "friends", "solo"}:
+        base["party_type"] = party.strip().lower()
+    flags = dict(base.get("intent") or {})
+    for key in (
+        "needs_prediction",
+        "needs_alternatives",
+        "needs_current_context",
+        "needs_trip_plan",
+    ):
+        flags[key] = bool(flags.get(key)) or _slot_bool(slots, key)
+    if flags.get("needs_trip_plan"):
+        flags["needs_alternatives"] = True
+        flags["needs_current_context"] = True
+    if base.get("start_date") and base.get("end_date"):
+        base["is_multi_day"] = True
+    base["intent"] = flags
+    base["needs_web"] = bool(flags.get("needs_current_context"))
+    base["wants_alternatives"] = bool(flags.get("needs_alternatives"))
+    return base

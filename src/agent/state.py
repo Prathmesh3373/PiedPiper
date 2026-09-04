@@ -55,13 +55,15 @@ class TourismState(TypedDict, total=False):
     sources: list[dict]
     candidate_alternatives: list[dict]
     ranked_alternatives: list[dict]
+    alternative_research: dict[str, dict]
     trip_plan: list[dict]
     tool_trace: list[str]
     critic_retries: int
     critic_done: bool
     period_pressure: dict
     brain_steps: int
-    brain_response: str
+    brain_source: str | None
+    brain_ran_tools: bool
     final_response: str
     answer_source: str
     messages: Annotated[list[Any], add_messages]

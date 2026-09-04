@@ -103,6 +103,18 @@ def rank_alternatives_tool(anchor: str, interests: str = "", location: str = "")
 
 
 @tool
+def research_alternative_tool(
+    destination: str,
+    start_date: str = "",
+    end_date: str = "",
+    state: str = "",
+    climate_zone: str = "",
+) -> str:
+    """Research one candidate alternative for the same travel window. Checks local profile and ASI history first; only uses web evidence when local data is incomplete, then assesses weekends/season/events for that candidate. Call this before recommending an alternative."""
+    return _json({"queued": True, "destination": destination, "start_date": start_date, "end_date": end_date})
+
+
+@tool
 def web_search_tool(query: str, domains: str = "", official_only: bool = True) -> str:
     """Search the public web for destination facts, famous places, events, weather. You write the query, including official names and aliases (e.g. Belagavi Belgaum). Never fabricate URLs. official_only=true prefers government tourism hosts. Not a visitor-count source."""
     domain_list = [x.strip() for x in domains.split(",") if x.strip()] or None
@@ -187,5 +199,6 @@ ALL_TOOLS = [
     assess_period_pressure_tool,
     find_similar_destinations_tool,
     rank_alternatives_tool,
+    research_alternative_tool,
     optimize_trip_tool,
 ]
